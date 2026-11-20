@@ -1,0 +1,14 @@
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.GeneratedMSBuildEditorConfig.editorconfig
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.AssemblyInfoInputs.cache
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.AssemblyInfo.cs
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.csproj.CoreCompileInputs.cache
+/workspace/unity/Verify/bin/Release/net8.0/AresCore.Verify
+/workspace/unity/Verify/bin/Release/net8.0/AresCore.Verify.deps.json
+/workspace/unity/Verify/bin/Release/net8.0/AresCore.Verify.runtimeconfig.json
+/workspace/unity/Verify/bin/Release/net8.0/AresCore.Verify.dll
+/workspace/unity/Verify/bin/Release/net8.0/AresCore.Verify.pdb
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.dll
+/workspace/unity/Verify/obj/Release/net8.0/refint/AresCore.Verify.dll
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.pdb
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.genruntimeconfig.cache
+/workspace/unity/Verify/obj/Release/net8.0/ref/AresCore.Verify.dll

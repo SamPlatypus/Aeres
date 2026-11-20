@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "ARES CORE",
+      "hasCanvas": false,
+      "bodyTextLen": 5620,
+      "bodyTextHash": "7f28755332d260e34aa310cf4e11d4af6ffeff0cc11d0d3335814e9c480a5055",
+      "bodyTextPrefix": "TORQUE-FREE EULER ARES CORE Sea-level Earth, point-mass gravity,",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "ARES CORE",
+      "hasCanvas": false,
+      "bodyTextLen": 5620,
+      "bodyTextHash": "7f28755332d260e34aa310cf4e11d4af6ffeff0cc11d0d3335814e9c480a5055",
+      "bodyTextPrefix": "TORQUE-FREE EULER ARES CORE Sea-level Earth, point-mass gravity,",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}
