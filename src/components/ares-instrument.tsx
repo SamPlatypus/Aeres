@@ -3,13 +3,16 @@ import { clsx } from "clsx";
 import { Copy, Download, RotateCcw } from "lucide-react";
 import { BurnChart, type BurnPoint } from "@/components/burn-chart";
 import { G0_MPS2, VACUUM_ISP_S } from "@/physics/constants";
+import { ATTITUDE_KD, ATTITUDE_KP, GIMBAL_LIMIT_RAD } from "@/physics/attitude-controller";
+import { COP_AXIAL_OFFSET_M } from "@/physics/aero-moment";
 import { CYLINDER_HEIGHT_M, CYLINDER_RADIUS_M, THRUST_AXIAL_OFFSET_M } from "@/physics/cylinder-inertia";
 import { COAST_END_S, CUTOFF_AT_60_S } from "@/physics/cutoff";
 import { DEFAULT_PITCH_PROGRAM, PURE_VERTICAL_PROGRAM } from "@/physics/pitch-program";
-import { runCoastBurn, runKeplerCoast, runMarsEntry, runMarsTerminalLanding, runMarsVerticalBurn, runPitchedBurn, runVerticalBurn, type SimulationReport } from "@/physics/simulation-harness";
+import { runCoastBurn, runKeplerCoast, runMarsEntry, runMarsTerminalLanding, runMarsVerticalBurn, runPitchedBurn, runVerticalBurn, runWeathercockCoast, type SimulationReport } from "@/physics/simulation-harness";
 import { DEFAULT_TERMINAL_SEQUENCE, EARLY_TERMINAL_SEQUENCE } from "@/physics/terminal-sequence";
 import type { TelemetryFrame } from "@/physics/telemetry";
 import { MARS_ENTRY_INTERFACE, marsEntryOrDefault } from "@/physics/vehicle-state";
+import { QuaternionD } from "@/physics/quaternion";
 import { Vector3d } from "@/physics/vector3d";
 
 const TUMBLE_AXIS = new Vector3d(1, 0.65, 0.35).normalized;
@@ -19,6 +22,8 @@ const SOURCE_FILES = [
   "Assets/Scripts/Math/QuaternionD.cs",
   "Assets/Scripts/PhysicsCore/VehicleState.cs",
   "Assets/Scripts/PhysicsCore/CylinderInertia.cs",
+  "Assets/Scripts/PhysicsCore/AeroMoment.cs",
+  "Assets/Scripts/PhysicsCore/AttitudeController.cs",
   "Assets/Scripts/PhysicsCore/PlanetaryEnvironment.cs",
   "Assets/Scripts/PhysicsCore/PropulsionModel.cs",
   "Assets/Scripts/PhysicsCore/PitchProgram.cs",
@@ -126,9 +131,12 @@ export function AresInstrument() {
   const [entryPropellant, setEntryPropellant] = useState(50_000);
   const [entryGamma, setEntryGamma] = useState(-12);
   const [substeps, setSubsteps] = useState(1);
-  const [bodyRate, setBodyRate] = useState<0 | 0.05 | 0.1>(0.05);
+  const [bodyRate, setBodyRate] = useState<0 | 0.05 | 0.1>(0);
   const [bodyAxis, setBodyAxis] = useState<"x" | "y" | "z" | "tumble">("tumble");
   const [gimbalDeg, setGimbalDeg] = useState<0 | 0.01 | 0.02>(0);
+  const [controller, setController] = useState(true);
+  const [pitchErrorDeg, setPitchErrorDeg] = useState<0 | 5>(0);
+  const [weathercock, setWeathercock] = useState(false);
   const [index, setIndex] = useState<number | "end">("end");
   const [copied, setCopied] = useState(false);
   const [chartReady, setChartReady] = useState(false);
@@ -142,9 +150,17 @@ export function AresInstrument() {
     return new Vector3d(bodyRate, 0, 0);
   }, [bodyAxis, bodyRate]);
   const gimbalRad = (gimbalDeg * Math.PI) / 180;
+  const pitchAttitude = useMemo(
+    () => (pitchErrorDeg === 0 ? null : QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), (pitchErrorDeg * Math.PI) / 180)),
+    [pitchErrorDeg],
+  );
   const vacuumSeal = useMemo(() => runVerticalBurn(true, substeps), [substeps]);
   const report: SimulationReport = useMemo(() => {
+    if (weathercock) return runWeathercockCoast(substeps);
     const vacuum = mode === "vacuum";
+    if (pitchAttitude) {
+      return runVerticalBurn(vacuum, substeps, Vector3d.zero, controller ? 0 : gimbalRad, controller, pitchAttitude);
+    }
     if (body === "mars") {
       if (origin === "entry") {
         const entryState = marsEntryOrDefault(entrySpeed, entryPropellant, entryGamma);
@@ -183,15 +199,16 @@ export function AresInstrument() {
         engine === "cutoff" ? COAST_END_S : 90,
         omega,
         gimbalRad,
+        controller,
       );
     }
     if (engine === "cutoff") {
-      return runCoastBurn(vacuum, substeps, guided, CUTOFF_AT_60_S, COAST_END_S, omega, gimbalRad);
+      return runCoastBurn(vacuum, substeps, guided, CUTOFF_AT_60_S, COAST_END_S, omega, gimbalRad, controller);
     }
-    if (program === "pitch") return runPitchedBurn(vacuum, substeps, DEFAULT_PITCH_PROGRAM, omega, gimbalRad);
-    if (vacuum) return bodyRate === 0 && gimbalRad === 0 ? vacuumSeal : runVerticalBurn(true, substeps, omega, gimbalRad);
-    return runVerticalBurn(false, substeps, omega, gimbalRad);
-  }, [body, bodyRate, coast, engine, entryGamma, entryPropellant, entrySpeed, gimbalRad, guidance, horizontal, mode, omega, origin, program, substeps, terminal, vacuumSeal]);
+    if (program === "pitch") return runPitchedBurn(vacuum, substeps, DEFAULT_PITCH_PROGRAM, omega, gimbalRad, controller);
+    if (vacuum && !controller && bodyRate === 0 && gimbalRad === 0) return vacuumSeal;
+    return runVerticalBurn(vacuum, substeps, omega, controller ? 0 : gimbalRad, controller);
+  }, [body, bodyRate, coast, controller, engine, entryGamma, entryPropellant, entrySpeed, gimbalRad, guidance, horizontal, mode, omega, origin, pitchAttitude, program, substeps, terminal, vacuumSeal, weathercock]);
 
   const frameIndex = index === "end" ? report.frames.length - 1 : Math.min(index, report.frames.length - 1);
   const frame = report.frames[frameIndex] ?? report.frames[report.frames.length - 1];
@@ -277,9 +294,13 @@ export function AresInstrument() {
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <p className="text-xs tracking-widest text-primary uppercase">
-              {gimbalDeg > 0
+              {pitchErrorDeg > 0 || (controller && !weathercock && body === "earth" && !terminalArmed)
+                ? "Attitude hold"
+                : weathercock
+                ? "Aero moment"
+                : gimbalDeg > 0 && !controller
                 ? "Gimbal moment"
-                : bodyRate > 0
+                : bodyRate > 0 && !controller
                 ? "Torque-free Euler"
                 : proportional || entryTuned
                 ? "Mars GNC · Pass 8"
@@ -299,20 +320,20 @@ export function AresInstrument() {
             </p>
             <h1 className="mt-1 font-mono text-3xl leading-none text-fg sm:text-4xl">ARES CORE</h1>
             <p className="mt-2 max-w-xl text-sm text-pretty text-muted">
-              {body === "mars"
+              {weathercock ? null : body === "mars"
                 ? origin === "entry"
                   ? terminal === "default"
                     ? proportional
                       ? "Proportional landing law after the 3 km gate. The share is clamp(horizontal speed / 500 m/s, 0, 0.75) and is held for each 0.02 s step. Throttle stays 60%."
                       : fixedFraction > 0
-                      ? "Terminal sequence armed. Coast to 3 km, flip upright with thrust off, then a 60% burn aimed between local up and the anti-horizontal direction. The aim is held for each 0.02 s step."
-                      : "Terminal sequence armed. Coast to 3 km, flip to local vertical in 8 s with thrust off, then a 60% landing burn. Radial speed within 2 m/s and horizontal speed within 0.5 m/s is nominal. Anything faster is a RUD."
+                      ? "Terminal sequence armed. Coast to 3 km, then a powered flip at 60% thrust. The pitch loop holds the nose within 5° of local vertical before the landing burn aims between local up and the anti-horizontal direction."
+                      : "Terminal sequence armed. Coast to 3 km. The flip holds 60% thrust along body +Y and the pitch loop drives that axis onto local vertical. The landing burn starts only inside 5°. Radial speed within 2 m/s and horizontal speed within 0.5 m/s is nominal. An impact before that gate is a RUD."
                     : terminal === "early"
                       ? proportional
-                        ? "Proportional landing law after the 5 km gate, then full thrust. The share is clamp(horizontal speed / 500 m/s, 0, 0.75). A 3.5 km/s, 200 t entry still meets the surface during the 8 s unpowered flip."
+                        ? "Proportional landing law after the 5 km gate, then full thrust. The share is clamp(horizontal speed / 500 m/s, 0, 0.75). The flip is the same powered pitch loop."
                         : fixedFraction > 0
-                        ? "Earlier gate at 5 km, full thrust, with the same scheduled horizontal share on the landing burn. The touchdown gate is unchanged."
-                        : "Earlier gate at 5 km, then the same 8 s flip and a 100% vertical burn. The touchdown gate is unchanged. This open-loop burn does not cancel horizontal speed."
+                        ? "Earlier gate at 5 km, powered flip, then full thrust with the scheduled horizontal share. The touchdown gate is unchanged."
+                        : "Earlier gate at 5 km, then the same powered flip and a 100% vertical burn. The touchdown gate is unchanged. Vertical thrust does not cancel horizontal speed."
                       : entryTuned
                         ? `Entry ${formatFixed(entrySpeed, 0)} m/s at ${formatFixed(entryGamma, 1)}°, ${formatFixed(entryPropellant, 0)} kg. Altitude stays 125 km. Engines stay off until a terminal sequence is armed.`
                         : mode === "vacuum"
@@ -346,13 +367,23 @@ export function AresInstrument() {
                   : mode === "vacuum"
                     ? "Gravity and atmosphere are off. Inertial speed must match the ideal rocket equation within 0.1%."
                     : "Sea-level Earth, point-mass gravity, exponential air. 100% thrust along inertial +Y for 90 seconds."}
-              {bodyRate > 0 && gimbalDeg === 0
-                ? bodyAxis === "tumble"
-                  ? ` Torque-free tumble at ${bodyRate.toFixed(2)} rad/s on a ${CYLINDER_HEIGHT_M} m × ${CYLINDER_RADIUS_M} m cylinder. External torque is zero. ωx and ωz exchange while ωy holds. |L| is conserved in the inertial frame at constant mass, and scales with mass while propellant leaves. Translation matches ω = 0.`
-                  : ` Principal spin ${bodyRate.toFixed(2)} rad/s about body +${bodyAxis.toUpperCase()}. External torque is zero, so this rate stays on the axis. Translation matches ω = 0.`
-                : ""}
-              {gimbalDeg > 0
-                ? ` Gimbal ${gimbalDeg.toFixed(2)}° from body +Y toward +X${bodyRate > 0 ? `, with the ${bodyRate.toFixed(2)} rad/s body rate still on the vehicle` : ""}. Thrust acts ${THRUST_AXIAL_OFFSET_M} m aft of the CoM, so M = r × F and αz = Mz / Izz from rest. Zero gimbal restores Pass 10 and the translational baselines.`
+              {weathercock || pitchErrorDeg > 0 || controller || gimbalDeg > 0 || bodyRate === 0
+                ? ""
+                : bodyAxis === "tumble"
+                  ? mode === "vacuum"
+                    ? ` Torque-free tumble at ${bodyRate.toFixed(2)} rad/s on a ${CYLINDER_HEIGHT_M} m × ${CYLINDER_RADIUS_M} m cylinder. External torque is zero. ωx and ωz exchange while ωy holds. |L| is conserved at constant mass. Translation matches ω = 0.`
+                    : ` Tumble at ${bodyRate.toFixed(2)} rad/s. ωy holds. In vacuum the exchange is torque-free. In air the center of pressure, ${COP_AXIAL_OFFSET_M} m aft, adds a restoring Mz when the nose leaves the velocity vector.`
+                  : mode === "vacuum"
+                    ? ` Principal spin ${bodyRate.toFixed(2)} rad/s about body +${bodyAxis.toUpperCase()}. External torque is zero, so this rate stays on the axis. Translation matches ω = 0.`
+                    : ` Principal spin ${bodyRate.toFixed(2)} rad/s about body +${bodyAxis.toUpperCase()}. The rate stays on the axis while the angle of attack is zero. A lateral velocity brings in the restoring aero moment.`}
+              {pitchErrorDeg > 0
+                ? ` ${controller ? "Attitude hold" : "Open loop"} from a ${pitchErrorDeg}° pitch error. δ = −(${ATTITUDE_KP} θ + ${ATTITUDE_KD} ωz), stopped at ±${((GIMBAL_LIMIT_RAD * 180) / Math.PI).toFixed(0)}°. A zero error leaves the sealed burn unchanged. Controller off forces δ = 0.`
+                : weathercock
+                ? ` Engines off, gravity off, sea-level air. The nose starts 5° off a 100 m/s +Y velocity. The center of pressure is ${COP_AXIAL_OFFSET_M} m aft of the CoM, so a positive angle of attack produces a negative Mz and the nose weathervanes back through zero. Vacuum and zero angle of attack leave the translational baselines unchanged.`
+                : !controller && gimbalDeg > 0
+                ? ` Gimbal ${gimbalDeg.toFixed(2)}° from body +Y toward +X${bodyRate > 0 ? `, with the ${bodyRate.toFixed(2)} rad/s body rate still on the vehicle` : ""}. Thrust acts ${THRUST_AXIAL_OFFSET_M} m aft of the CoM, so M = r × F and αz = Mz / Izz from rest. Zero gimbal restores the torque-free model and the translational baselines.`
+                : controller
+                ? " Pitch hold is armed. δ = −(Kp θ + Kd ωz) about body Z, clamped to ±5°. With no pitch error and no body rate the command is zero and the burn matches the sealed baseline."
                 : ""}
             </p>
           </div>
@@ -538,10 +569,42 @@ export function AresInstrument() {
           </div>
         </div>
         <div className="sm:w-64">
+          <div className="mb-2 text-xs tracking-widest text-muted uppercase">Pitch disturbance</div>
+          <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border" role="radiogroup" aria-label="Aerodynamic pitch disturbance">
+            <ModeButton active={!weathercock} onClick={() => setWeathercock(false)}>
+              Burn
+            </ModeButton>
+            <ModeButton active={weathercock} onClick={() => setWeathercock(true)}>
+              5° coast
+            </ModeButton>
+          </div>
+        </div>
+        <div className="sm:w-64">
+          <div className="mb-2 text-xs tracking-widest text-muted uppercase">Attitude hold</div>
+          <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border" role="radiogroup" aria-label="Attitude controller">
+            <ModeButton active={controller} onClick={() => setController(true)}>
+              On
+            </ModeButton>
+            <ModeButton active={!controller} onClick={() => setController(false)}>
+              Off
+            </ModeButton>
+          </div>
+        </div>
+        <div className="sm:w-64">
+          <div className="mb-2 text-xs tracking-widest text-muted uppercase">Pitch error</div>
+          <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border" role="radiogroup" aria-label="Initial pitch error">
+            {([0, 5] as const).map((angle) => (
+              <ModeButton key={angle} active={pitchErrorDeg === angle} onClick={() => setPitchErrorDeg(angle)}>
+                {angle === 0 ? "0°" : "5°"}
+              </ModeButton>
+            ))}
+          </div>
+        </div>
+        <div className="sm:w-64">
           <div className="mb-2 text-xs tracking-widest text-muted uppercase">Gimbal</div>
           <div className="grid grid-cols-3 gap-px overflow-hidden rounded-md border border-border bg-border" role="radiogroup" aria-label="Gimbal deflection">
             {([0, 0.01, 0.02] as const).map((angle) => (
-              <ModeButton key={angle} active={gimbalDeg === angle} onClick={() => setGimbalDeg(angle)}>
+              <ModeButton key={angle} active={gimbalDeg === angle} disabled={controller} onClick={() => setGimbalDeg(angle)}>
                 {angle === 0 ? "0°" : `${angle.toFixed(2)}°`}
               </ModeButton>
             ))}
@@ -794,9 +857,11 @@ export function AresInstrument() {
                     : ""}
               </p>
               <p className="mt-1 font-mono text-xs tabular-nums text-muted">
-                Mz {formatFixed(frame.momentZ, 0)} N·m
+                θ {formatFixed((frame.pitchAngleRad * 180) / Math.PI, 3)}°
                 <span className="mx-1">·</span>
-                αz {frame.alphaZ.toExponential(3)} rad/s²
+                δ {formatFixed((frame.gimbalRad * 180) / Math.PI, 3)}°
+                <span className="mx-1">·</span>
+                Mz {formatFixed(frame.momentZ, 0)} N·m
               </p>
             </div>
           </div>
@@ -831,6 +896,10 @@ export function AresInstrument() {
             <Channel label="L inertial z" value={formatFixed(frame.angularMomentumInertialZ, 0)} unit="kg·m²/s" />
             <Channel label="Ixx = Izz" value={formatFixed(frame.inertiaIxx, 0)} unit="kg·m²" />
             <Channel label="Iyy" value={formatFixed(frame.inertiaIyy, 0)} unit="kg·m² · axial" />
+            <Channel label="Pitch error" value={formatFixed((frame.pitchAngleRad * 180) / Math.PI, 3)} unit="deg about Z" />
+            <Channel label="Gimbal command" value={formatFixed((frame.gimbalRad * 180) / Math.PI, 3)} unit={controller ? "PD · ±5°" : "open loop"} />
+            <Channel label="Angle of attack" value={formatFixed((frame.angleOfAttackRad * 180) / Math.PI, 3)} unit="deg" />
+            <Channel label="Aero moment z" value={formatFixed(frame.aeroMomentZ, 0)} unit="N·m" />
             <Channel label="Gimbal" value={formatFixed((frame.gimbalRad * 180) / Math.PI, 3)} unit="deg from +Y" />
             <Channel label="Moment z" value={formatFixed(frame.momentZ, 0)} unit="N·m" />
             <Channel label="αz" value={formatFixed(frame.alphaZ, 6)} unit="rad/s²" />
@@ -945,7 +1014,7 @@ export function AresInstrument() {
           <li>Δv = Isp g0 ln(m0 / mf)</li>
           <li>q̇ = ½ q ⊗ ω</li>
           <li>I ω̇ + ω × Iω = M</li>
-          <li>M = r × F</li>
+          <li>δ = −(Kp θ + Kd ωz)</li>
         </ul>
         <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
           <Const k="μ Earth" v="3.986004418×10¹⁴ m³/s²" />
@@ -960,6 +1029,8 @@ export function AresInstrument() {
           <Const k="Cylinder" v={`${CYLINDER_HEIGHT_M} m · R ${CYLINDER_RADIUS_M} m`} />
           <Const k="Inertia" v="Iyy = ½mR² · Ixx = Izz" />
           <Const k="Torque" v={gimbalDeg === 0 ? "M = 0" : "M = r × F"} />
+          <Const k="Hold" v={controller ? `Kp ${ATTITUDE_KP} · Kd ${ATTITUDE_KD} s` : "controller off"} />
+          <Const k="CoP" v={`${COP_AXIAL_OFFSET_M} m aft of CoM`} />
           <Const k="Offset" v={`${THRUST_AXIAL_OFFSET_M} m aft of CoM`} />
           {body === "mars" ? (
             <>
@@ -971,8 +1042,8 @@ export function AresInstrument() {
               <Const k="Sound Mars" v="240 m/s" />
               {terminalArmed ? (
                 <>
-                  <Const k="Flip" v="8 s · thrust off" />
-                  <Const k="Landing thrust" v={terminal === "early" ? "100% after 5 km" : "60% after 3 km"} />
+                  <Const k="Flip" v="60% until within 5° of vertical" />
+                  <Const k="Landing thrust" v={terminal === "early" ? "100% after alignment" : "60% after alignment"} />
                   <Const k="Nominal" v="|vrad| ≤ 2 · vh ≤ 0.5 m/s" />
                   {proportional ? (
                     <>
@@ -987,7 +1058,7 @@ export function AresInstrument() {
           ) : null}
         </dl>
         <p className="mt-4 text-sm text-pretty text-muted">
-          No wind, no planetary rotation. The vehicle is a uniform cylinder, 50 m tall and 4.5 m in radius, so the inertia tensor scales with the current mass. The nozzle sits half a length aft of the center of mass. A zero gimbal keeps thrust on the body axis, the moment is zero, and Euler’s equation is the torque-free Pass 10 model. A fixed gimbal holds the thrust vector off +Y, maps that direction into M = r × F, and integrates it with the translational step. Set the gimbal and the body rate to 0 to reproduce every translational baseline. J2 is implemented and left off for this
+          No wind, no planetary rotation. The vehicle is a uniform cylinder, 50 m tall and 4.5 m in radius, so the inertia tensor scales with the current mass. The nozzle sits half a length aft of the center of mass. A pitch loop commands the gimbal, δ = −(Kp θ + Kd ωz), and stops it at ±5°. Controller off, or a zero pitch error with zero rate, leaves that command at zero and the translational burn unchanged. The center of pressure sits a quarter length aft, so a positive angle of attack produces a negative restoring moment. That moment is identically zero in vacuum and at zero angle of attack, and it is not added to the translational force. Set the controller off and the gimbal and body rate to 0 to reproduce every translational baseline. J2 is implemented and left off for this
           verification. g0 defines exhaust velocity only. Local gravity is μ/r², about 9.820 m/s² at the surface
           with these constants. Cutoff sets thrust and mass flow to zero. Numerical coast keeps RK4, including
           drag on Earth. Analytic Kepler replaces that coast with a universal-variable step and zero drag. The
@@ -995,10 +1066,10 @@ export function AresInstrument() {
           verified burn numbers.
           {terminalArmed
             ? proportional
-              ? " Terminal sequence is open-loop and Mars-entry only. Proportional mode sets the landing-burn horizontal share from current horizontal speed and holds that direction for each 0.02 s step. Fixed mode with fraction 0 keeps the Pass 6 burn."
+              ? " The flip is a powered pitch loop on body Z, Mars entry only. Proportional mode sets the landing-burn horizontal share from current horizontal speed after the nose is within 5° of vertical. Locking the gimbal leaves the vehicle unaligned and the impact is a RUD."
               : fixedFraction > 0
-              ? " Terminal sequence is open-loop and Mars-entry only. The landing burn mixes local up with a share opposing horizontal velocity, held constant across each RK4 step. Set Horiz to 0 to restore the Pass 6 vertical burn."
-              : " Terminal sequence is open-loop and Mars-entry only. The flip slews thrust from anti-velocity to local up, then holds vertical thrust. Impact altitude is clamped at 0. Leave Terminal off to keep the Pass 1–5 numbers."
+              ? " The flip is a powered pitch loop on body Z, Mars entry only. After alignment the landing burn mixes local up with a share opposing horizontal velocity. Set Horiz to 0 for a vertical landing burn."
+              : " The flip holds 60% thrust along body +Y. Gimbal deflection is −(Kp θ + Kd ωz), stopped at ±5°, and the landing burn waits until the nose is within 5° of local vertical. An impact before that gate is a RUD. Leave Terminal off to keep the Pass 1–5 numbers."
             : body === "mars"
             ? " Mars uses the same integrator. Surface gravity is μ/R², about 3.73 m/s². The entry start does not change any Earth run."
             : ""}

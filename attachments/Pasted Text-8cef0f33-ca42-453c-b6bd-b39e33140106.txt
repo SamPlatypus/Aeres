@@ -1,0 +1,27 @@
+Continue from the verified gimbal and Euler engine. Implement Aerodynamic Moment and Center of Pressure (CoP).
+
+1. Geometry & Coordinate Setup:
+   - Body longitudinal axis is +Y (nose along +Y, aft/engines along -Y). Vehicle height is 50.0 m, radius is 4.5 m. Center of Mass (CoM) is (0, 0, 0).
+   - Center of Pressure (CoP) is located aft of CoM for aerodynamic pitch stability at r_cop = (0, -CopAxialOffsetM, 0), where CopAxialOffsetM = 12.5 m (H/4).
+   - Aerodynamic reference area is S = 60.0 m^2 (matching DRAG_AREA_M2).
+
+2. Angle of Attack (AoA) & Normal Force Model:
+   - For velocity v_rel in the body XY plane, compute signed angle of attack α between body +Y and relative velocity: α = atan2(v_x, v_y).
+   - Aerodynamic normal force acts laterally along the body +X axis:
+     F_normal = 0.5 * rho * |v|^2 * S * sin(α).
+
+3. Restoring Moment:
+   - Compute aerodynamic torque about CoM: M = r_cop × F_aero.
+   - Cross product gives M_z = r_cop.Y * F_normal.X = (-CopAxialOffsetM) * F_normal = -CopAxialOffsetM * 0.5 * rho * |v|^2 * S * sin(α).
+   - Sign convention: A positive pitch angle (α > 0) creates an aft lateral force that produces a negative restoring torque (M_z < 0), naturally driving α back toward 0.
+
+4. Regression Verification (Invariants):
+   - Vacuum check: When rho = 0, M_aero = (0, 0, 0). All prior torque-free Euler and constant gimbal baseline numbers reproduce identically.
+   - Zero-AoA check: When α = 0, M_aero = (0, 0, 0).
+   - Deterministic test: At reference static condition (rho = 1.225 kg/m^3, v = 100.0 m/s, α = 90°), verify M_z equals exactly -4,593,750.0 N·m (-12.5 * 0.5 * 1.225 * 10000 * 60 * 1.0).
+   - Translational baseline check: When aero moment is zero, translational states remain unchanged.
+
+5. Dynamic Validation Test (Separate from Invariant Regression):
+   - In atmospheric flight with thrusters disabled and an initial pitch disturbance (e.g., α = 5°), verify attitude undergoes stable bounded restoring oscillation without numerical divergence.
+
+Extend only. Complete C# 9. No placeholders.

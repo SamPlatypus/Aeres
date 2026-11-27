@@ -3,6 +3,7 @@ import { commandThrottle, specificMechanicalEnergyM2S2, type CutoffCommand } fro
 import { evaluateForces, stepRk4, advanceAttitude, type ForceEvaluation } from "./integrator-rk4.ts";
 import { keplerElements, propagateKepler, type KeplerElements } from "./kepler.ts";
 import { altitudeM, createEarthEnvironment, createMarsEnvironment, type PlanetaryEnvironment } from "./planetary-environment.ts";
+import { effectiveGimbalRad, verticalTargetRad } from "./attitude-controller.ts";
 import { bodyThrustDirection } from "./cylinder-inertia.ts";
 import { pitchAngleDeg, thrustDirectionAt, type PitchProgram } from "./pitch-program.ts";
 import { createDefaultPropulsion, idealRocketDeltaVMps, massFlowKgS } from "./propulsion.ts";
@@ -20,6 +21,7 @@ import {
   type TerminalSequenceConfig,
 } from "./terminal-sequence.ts";
 import { formatLogLine, frameFromForce, stampAttitude, type TelemetryFrame } from "./telemetry.ts";
+import { QuaternionD } from "./quaternion.ts";
 import { cloneState, createEntryState, createSeaLevelState, withTranslation, MARS_ENTRY_INTERFACE, type EntryInterface, type VehicleState } from "./vehicle-state.ts";
 import { Vector3d } from "./vector3d.ts";
 
@@ -86,8 +88,8 @@ function sampleState(
   body = env.name,
   speedOfSoundMps = env.speedOfSoundMps,
 ): TelemetryFrame {
-  const steered =
-    state.gimbalRad !== 0 && throttle > 0 ? state.attitude.rotate(bodyThrustDirection(state.gimbalRad)) : thrustDirection;
+  const delta = effectiveGimbalRad(state);
+  const steered = delta !== 0 && throttle > 0 ? state.attitude.rotate(bodyThrustDirection(delta)) : thrustDirection;
   const force = evaluateForces(
     state.position,
     state.velocity,
@@ -99,7 +101,7 @@ function sampleState(
   );
   const mu = env.gravityEnabled ? env.muM3S2 : 0;
   const pitchDeg =
-    state.gimbalRad !== 0 && throttle > 0 ? (Math.atan2(steered.x, steered.y) * 180) / Math.PI : thrustPitchDeg;
+    delta !== 0 && throttle > 0 ? (Math.atan2(steered.x, steered.y) * 180) / Math.PI : thrustPitchDeg;
   return stampAttitude(
     frameFromForce(
       timeS,
@@ -133,6 +135,8 @@ export function runVerticalBurn(
   substeps = 1,
   angularVelocityBody: Vector3d = Vector3d.zero,
   gimbalRad = 0,
+  controllerEnabled = false,
+  initialAttitude: QuaternionD | null = null,
 ): SimulationReport {
   if (!Number.isInteger(substeps) || substeps < 1) {
     throw new Error("substeps must be a positive integer");
@@ -144,7 +148,8 @@ export function runVerticalBurn(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
+  if (initialAttitude) state = { ...state, attitude: initialAttitude, initialAttitude };
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
 
@@ -218,6 +223,86 @@ export function runVerticalBurn(
   };
 }
 
+/** Unpowered atmospheric coast used to show the restoring aerodynamic moment. */
+export const WEATHERCOCK_DURATION_S = 120;
+export const WEATHERCOCK_SPEED_MPS = 100;
+export const WEATHERCOCK_ALPHA_DEG = 5;
+
+/**
+ * Engines off. Gravity off so the inertial velocity stays on +Y and α is the body pitch.
+ * Atmosphere on. Initial attitude is a +Z rotation of `alphaDeg`, so α starts at that angle.
+ * The center of pressure is aft of the CoM, so M_z restores α toward 0.
+ */
+export function runWeathercockCoast(substeps = 1, alphaDeg = WEATHERCOCK_ALPHA_DEG, speedMps = WEATHERCOCK_SPEED_MPS): SimulationReport {
+  if (!Number.isInteger(substeps) || substeps < 1) throw new Error("substeps must be a positive integer");
+  const env = createEarthEnvironment({ gravityEnabled: false, atmosphereEnabled: true, includeJ2: false });
+  const propulsion = createDefaultPropulsion();
+  const alphaRad = (alphaDeg * Math.PI) / 180;
+  const attitude = alphaRad === 0 ? QuaternionD.identity : QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), alphaRad);
+  let state = createSeaLevelState(env, Vector3d.zero, 0, false);
+  state = {
+    ...state,
+    velocity: new Vector3d(0, speedMps, 0),
+    attitude,
+    initialAttitude: attitude,
+  };
+  const initialVelocity = state.velocity;
+  const initialMassKg = state.totalMassKg;
+  const steps = WEATHERCOCK_DURATION_S * STEP_HZ;
+  const logEvery = LOG_INTERVAL_S * STEP_HZ;
+  const samples: TelemetryFrame[] = [];
+  const frames: TelemetryFrame[] = [];
+  const logLines: string[] = [];
+  logLines.push(
+    `ARES CORE weathercock | mode=ATMOSPHERE | gravity=off | thrust=0 | alpha0=${alphaDeg} deg | v=${speedMps} m/s | dt=0.02 s`,
+  );
+  for (let n = 0; n <= steps; n++) {
+    const timeS = n / STEP_HZ;
+    if (n % logEvery === 0 || n % FRAME_STRIDE === 0) {
+      const frame = sampleState(state, timeS, env, propulsion, 0, 0, Vector3d.up, timeS);
+      if (n % FRAME_STRIDE === 0) frames.push(frame);
+      if (n % logEvery === 0) {
+        samples.push(frame);
+        logLines.push(formatLogLine(frame));
+      }
+    }
+    if (n === steps) break;
+    state = stepRk4(state, 1 / STEP_HZ, substeps, env, propulsion, 0);
+  }
+  const finalMassKg = state.totalMassKg;
+  const ideal = idealRocketDeltaVMps(propulsion, initialMassKg, finalMassKg);
+  const achieved = state.velocity.sub(initialVelocity).magnitude;
+  const thrustDv = state.thrustIntegratedDeltaVMps;
+  const difference = ideal - achieved;
+  const relativeError = ideal > 0 ? Math.abs(achieved - ideal) / ideal : 0;
+  logLines.push(`ideal_dv_m_s=${ideal.toFixed(6)}`);
+  logLines.push(`achieved_dv_m_s=${achieved.toFixed(6)}`);
+  logLines.push("verdict=AERO_MOMENT engines off");
+  return {
+    disableGravityAndAtmosphere: false,
+    substeps,
+    samples,
+    frames,
+    logLines,
+    logText: logLines.join("\n"),
+    initialMassKg,
+    finalMassKg,
+    initialVelocity,
+    finalPosition: state.position,
+    finalVelocity: state.velocity,
+    idealDeltaVMps: ideal,
+    achievedDeltaVMps: achieved,
+    thrustIntegratedDeltaVMps: thrustDv,
+    differenceMps: difference,
+    relativeError,
+    vacuumCheckApplies: false,
+    vacuumCheckPassed: true,
+    pitchProgram: null,
+    cutoff: null,
+    endTimeS: WEATHERCOCK_DURATION_S,
+  };
+}
+
 /**
  * Same 90 s sea-level burn as Pass 1, with an open-loop thrust direction.
  * A program that never leaves +Y delegates to runVerticalBurn, so those numbers stay identical.
@@ -228,9 +313,10 @@ export function runPitchedBurn(
   program: PitchProgram,
   angularVelocityBody: Vector3d = Vector3d.zero,
   gimbalRad = 0,
+  controllerEnabled = false,
 ): SimulationReport {
   if (pitchAngleDeg(BURN_DURATION_S, program) === 0) {
-    return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad);
+    return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad, controllerEnabled);
   }
   if (!Number.isInteger(substeps) || substeps < 1) {
     throw new Error("substeps must be a positive integer");
@@ -242,7 +328,7 @@ export function runPitchedBurn(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
 
@@ -409,6 +495,7 @@ export function runCoastBurn(
   endTimeS: number,
   angularVelocityBody: Vector3d = Vector3d.zero,
   gimbalRad = 0,
+  controllerEnabled = false,
 ): SimulationReport {
   if (!Number.isInteger(substeps) || substeps < 1) {
     throw new Error("substeps must be a positive integer");
@@ -422,9 +509,9 @@ export function runCoastBurn(
     cutoff.propellantRemainingKg === null && (cutoff.tCutoffS === null || cutoff.tCutoffS > endTimeS);
   if (inactive && endTimeS === BURN_DURATION_S) {
     if (pitchAngleDeg(BURN_DURATION_S, program) === 0) {
-      return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad);
+      return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad, controllerEnabled);
     }
-    return runPitchedBurn(disableGravityAndAtmosphere, substeps, program, angularVelocityBody, gimbalRad);
+    return runPitchedBurn(disableGravityAndAtmosphere, substeps, program, angularVelocityBody, gimbalRad, controllerEnabled);
   }
 
   const env = createEarthEnvironment({
@@ -433,7 +520,7 @@ export function runCoastBurn(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
   const mark: CutoffMark = { timeS: null };
@@ -559,10 +646,11 @@ export function runKeplerCoast(
   endTimeS: number,
   angularVelocityBody: Vector3d = Vector3d.zero,
   gimbalRad = 0,
+  controllerEnabled = false,
 ): SimulationReport {
   const inactive =
     cutoff.propellantRemainingKg === null && (cutoff.tCutoffS === null || cutoff.tCutoffS > endTimeS);
-  if (inactive) return runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody, gimbalRad);
+  if (inactive) return runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody, gimbalRad, controllerEnabled);
   if (!Number.isInteger(substeps) || substeps < 1) {
     throw new Error("substeps must be a positive integer");
   }
@@ -577,7 +665,7 @@ export function runKeplerCoast(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
   const mark: CutoffMark = { timeS: null };
@@ -798,7 +886,7 @@ export function runMarsVerticalBurn(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+  let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, false);
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
   const logEvery = LOG_INTERVAL_S * STEP_HZ;
@@ -862,7 +950,7 @@ export function runMarsEntry(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createEntryState(env, entry, angularVelocityBody, gimbalRad);
+  let state = createEntryState(env, entry, angularVelocityBody, gimbalRad, false);
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
   const mu = env.gravityEnabled ? env.muM3S2 : 0;
@@ -973,8 +1061,8 @@ export function runMarsEntry(
 const TERMINAL_FRAME_STRIDE = 50;
 
 /**
- * Pass 6. Mars entry with an open-loop flip and landing burn.
- * Not called by any Pass 1–5 path. Engines stay off until the trigger.
+ * Mars entry with a torque-driven flip and landing burn.
+ * Not called by any Pass 1–5 path. Engines stay off until the 3 km trigger.
  */
 export function runMarsTerminalLanding(
   disableGravityAndAtmosphere: boolean,
@@ -995,7 +1083,7 @@ export function runMarsTerminalLanding(
     includeJ2: false,
   });
   const propulsion = createDefaultPropulsion();
-  let state = createEntryState(env, entry, angularVelocityBody, gimbalRad);
+  let state = createEntryState(env, entry, angularVelocityBody, gimbalRad, false);
   const initialVelocity = state.velocity;
   const initialMassKg = state.totalMassKg;
   const sequence = new TerminalSequence(config);
@@ -1031,7 +1119,22 @@ export function runMarsTerminalLanding(
     const height = altitudeM(env, state.position);
     const speed = state.velocity.magnitude;
     if (speed > peak) peak = speed;
-    const command = sequence.command(timeS, state.position, state.velocity, state.propellantMassKg, height);
+    const command = sequence.command(
+      timeS,
+      state.position,
+      state.velocity,
+      state.propellantMassKg,
+      height,
+      state.attitude,
+      state.angularVelocityBody.z,
+    );
+    const flipping = command.bodyThrust === true && config.flipControllerEnabled !== false;
+    state = {
+      ...state,
+      controllerEnabled: flipping,
+      pitchTargetRad: flipping ? verticalTargetRad(state.position) : 0,
+      flipHold: flipping,
+    };
     const phaseChanged = command.phase !== loggedPhase;
     const onLog = n % logEvery === 0;
     const onFrame = n % TERMINAL_FRAME_STRIDE === 0;
@@ -1042,6 +1145,7 @@ export function runMarsTerminalLanding(
 
     if (height <= 0) {
       impact = assessImpact(state, Math.max(peak, state.velocity.magnitude));
+      if (command.phase === "Flip") impact = { ...impact, flag: "RUD" };
       const landed = { ...state, position: state.position.magnitude > 0 ? state.position.normalized.scale(env.equatorialRadiusM) : new Vector3d(0, env.equatorialRadiusM, 0) };
       pushFrame(decorateTerminal(landed, timeS, env, propulsion, impactCommand(config, landed, command), impact, impact.peakSpeedMps), true);
       endTimeS = timeS;
@@ -1064,7 +1168,16 @@ export function runMarsTerminalLanding(
       const hitSpeed = state.velocity.magnitude;
       if (hitSpeed > peak) peak = hitSpeed;
       impact = assessImpact(state, peak);
-      const hitCommand = sequence.command(endTimeS, state.position, state.velocity, state.propellantMassKg, 0);
+      if (command.phase === "Flip") impact = { ...impact, flag: "RUD" };
+      const hitCommand = sequence.command(
+        endTimeS,
+        state.position,
+        state.velocity,
+        state.propellantMassKg,
+        0,
+        state.attitude,
+        state.angularVelocityBody.z,
+      );
       pushFrame(
         decorateTerminal(state, endTimeS, env, propulsion, impactCommand(config, state, hitCommand), impact, peak),
         true,

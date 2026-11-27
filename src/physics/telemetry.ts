@@ -1,4 +1,6 @@
 import type { ForceEvaluation } from "./integrator-rk4.ts";
+import { effectiveGimbalRad, pitchErrorRad } from "./attitude-controller.ts";
+import { aerodynamicMoment, angleOfAttackRad, velocityBody } from "./aero-moment.ts";
 import { eulerRate, gimbalMoment, inertialAngularMomentum, principalMoments } from "./cylinder-inertia.ts";
 import { flightPathAngleDeg, horizontalSpeedMps } from "./pitch-program.ts";
 import { QuaternionD } from "./quaternion.ts";
@@ -85,6 +87,14 @@ export interface TelemetryFrame {
   alphaX: number;
   alphaY: number;
   alphaZ: number;
+  /** Signed angle of attack, atan2(v_bx, v_by), radians. */
+  angleOfAttackRad: number;
+  /** Aerodynamic moment about body Z, N·m. Zero in vacuum and at α = 0. */
+  aeroMomentZ: number;
+  /** Pitch about body Z after canonicalizing the quaternion, radians. */
+  pitchAngleRad: number;
+  /** True when the PD gimbal law is armed. */
+  controllerEnabled: boolean;
   /** Rotation angle of the attitude relative to the initial quaternion, rad in [0, 2π). */
   rotationAngleRad: number;
 }
@@ -154,6 +164,10 @@ export function frameFromForce(
     alphaX: 0,
     alphaY: 0,
     alphaZ: 0,
+    angleOfAttackRad: 0,
+    aeroMomentZ: 0,
+    pitchAngleRad: 0,
+    controllerEnabled: false,
     rotationAngleRad: 0,
   };
 }
@@ -177,15 +191,25 @@ export function stampAttitude(frame: TelemetryFrame, state: VehicleState): Telem
   frame.inertiaIyy = inertia.iyy;
   frame.inertiaIzz = inertia.izz;
   frame.rotationAngleRad = QuaternionD.rotationAngleBetween(state.initialAttitude, state.attitude);
-  const moment = gimbalMoment(frame.thrustN, state.gimbalRad);
+  const aero = aerodynamicMoment(state.attitude, state.velocity, frame.densityKgM3);
+  const gimbal = effectiveGimbalRad(state);
+  const gimbalTorque = gimbalMoment(frame.thrustN, gimbal);
+  const moment =
+    aero.x === 0 && aero.y === 0 && aero.z === 0
+      ? gimbalTorque
+      : new Vector3d(gimbalTorque.x + aero.x, gimbalTorque.y + aero.y, gimbalTorque.z + aero.z);
   const alpha = eulerRate(state.angularVelocityBody, inertia, moment);
-  frame.gimbalRad = state.gimbalRad;
+  frame.gimbalRad = gimbal;
   frame.momentX = moment.x;
   frame.momentY = moment.y;
   frame.momentZ = moment.z;
   frame.alphaX = alpha.x;
   frame.alphaY = alpha.y;
   frame.alphaZ = alpha.z;
+  frame.angleOfAttackRad = angleOfAttackRad(velocityBody(state.attitude, state.velocity));
+  frame.aeroMomentZ = aero.z;
+  frame.pitchAngleRad = pitchErrorRad(state.attitude);
+  frame.controllerEnabled = state.controllerEnabled;
   return frame;
 }
 
@@ -239,5 +263,9 @@ export function formatLogLine(frame: TelemetryFrame): string {
     `ax=${frame.alphaX.toFixed(9)}`,
     `ay=${frame.alphaY.toFixed(9)}`,
     `az=${frame.alphaZ.toFixed(9)}`,
+    `aoa=${frame.angleOfAttackRad.toFixed(9)} rad`,
+    `Maero=${frame.aeroMomentZ.toFixed(3)}`,
+    `ctrl=${frame.controllerEnabled ? 1 : 0}`,
+    `perr=${frame.pitchAngleRad.toFixed(9)} rad`,
   ].join(" | ");
 }

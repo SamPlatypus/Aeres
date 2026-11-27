@@ -12,3 +12,4 @@
 /workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.pdb
 /workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.genruntimeconfig.cache
 /workspace/unity/Verify/obj/Release/net8.0/ref/AresCore.Verify.dll
+/workspace/unity/Verify/obj/Release/net8.0/AresCore.Verify.sourcelink.json

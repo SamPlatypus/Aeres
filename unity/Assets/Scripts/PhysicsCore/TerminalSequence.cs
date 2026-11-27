@@ -10,6 +10,8 @@ namespace MarsMission.PhysicsCore
         public double Throttle;
         public Vector3d Direction;
         public double PitchFromVerticalDeg;
+        /// <summary>True when flip thrust follows the body and the pitch loop.</summary>
+        public bool BodyThrust;
         /// <summary>0 keeps pure vertical. Set only on the landing burn when a horizontal share is commanded.</summary>
         public double HorizontalFraction;
         /// <summary>Proportional when that law is commanding. Empty on the fixed-fraction path.</summary>
@@ -34,7 +36,7 @@ namespace MarsMission.PhysicsCore
     {
         public const double DefaultTriggerAltitudeM = 3_000d;
         public const double DefaultFlipDurationS = 8d;
-        public const double DefaultFlipThrottle = 0d;
+        public const double DefaultFlipThrottle = 0.6d;
         public const double DefaultLandingThrottle = 0.6d;
         public const double NominalVerticalMps = 2d;
         public const double NominalHorizontalMps = 0.5d;
@@ -58,10 +60,11 @@ namespace MarsMission.PhysicsCore
         public readonly double ProportionalGain;
         public readonly double ProportionalSpeedRefMps;
         public readonly double MaxHorizontalFraction;
+        /// <summary>False locks the gimbal at zero and never opens the alignment gate.</summary>
+        public readonly bool FlipControllerEnabled;
 
         private double? _triggerAtS;
-        private Vector3d _retrograde;
-        private bool _hasRetrograde;
+        private bool _aligned;
 
         public double? ArmedAtS
         {
@@ -79,7 +82,8 @@ namespace MarsMission.PhysicsCore
             string guidanceMode = "FixedFraction",
             double proportionalGain = 1d,
             double proportionalSpeedRefMps = 500d,
-            double maxHorizontalFraction = 0.75d)
+            double maxHorizontalFraction = 0.75d,
+            bool flipControllerEnabled = true)
         {
             TriggerAltitudeM = triggerAltitudeM;
             TriggerTimeS = triggerTimeS;
@@ -95,6 +99,7 @@ namespace MarsMission.PhysicsCore
             ProportionalSpeedRefMps = proportionalSpeedRefMps;
             if (maxHorizontalFraction < 0d) maxHorizontalFraction = 0d;
             MaxHorizontalFraction = maxHorizontalFraction;
+            FlipControllerEnabled = flipControllerEnabled;
         }
 
         public static TerminalSequence DefaultProfile()
@@ -115,39 +120,25 @@ namespace MarsMission.PhysicsCore
 
         public TerminalCommand Command(double timeS, Vector3d position, Vector3d velocity, double propellantKg, double altitudeM)
         {
+            return Command(timeS, position, velocity, propellantKg, altitudeM, QuaternionD.Identity, 0d);
+        }
+
+        public TerminalCommand Command(double timeS, Vector3d position, Vector3d velocity, double propellantKg, double altitudeM, QuaternionD attitude, double omegaZ)
+        {
             Vector3d up = LocalUp(position);
             if (!_triggerAtS.HasValue)
             {
                 bool byTime = TriggerTimeS.HasValue && timeS >= TriggerTimeS.Value;
                 bool byAltitude = TriggerAltitudeM.HasValue && altitudeM > 0d && altitudeM <= TriggerAltitudeM.Value;
-                if (byTime || byAltitude)
-                {
-                    _triggerAtS = timeS;
-                    _retrograde = velocity.Magnitude > 0d ? velocity.Normalized * -1d : up;
-                    _hasRetrograde = true;
-                }
+                if (byTime || byAltitude) _triggerAtS = timeS;
             }
 
-            if (!_triggerAtS.HasValue || !_hasRetrograde)
+            if (!_triggerAtS.HasValue)
             {
                 return Coast(up);
             }
 
-            double elapsed = timeS - _triggerAtS.Value;
             bool cutoff = ManualCutoffS.HasValue && timeS >= ManualCutoffS.Value;
-            if (elapsed < FlipDurationS && !cutoff)
-            {
-                double blend = FlipDurationS > 0d ? elapsed / FlipDurationS : 1d;
-                Vector3d direction = SlerpUnit(_retrograde, up, blend);
-                return new TerminalCommand
-                {
-                    Phase = "Flip",
-                    Throttle = FlipThrottle,
-                    Direction = direction,
-                    PitchFromVerticalDeg = PitchFromVertical(direction, position)
-                };
-            }
-
             if (cutoff || propellantKg <= 0d)
             {
                 return new TerminalCommand
@@ -156,6 +147,27 @@ namespace MarsMission.PhysicsCore
                     Throttle = 0d,
                     Direction = up,
                     PitchFromVerticalDeg = 0d
+                };
+            }
+
+            if (!_aligned && FlipControllerEnabled && timeS > _triggerAtS.Value)
+            {
+                double error = AttitudeController.VerticalPitchErrorRad(attitude, position);
+                if (Math.Abs(error) <= AttitudeController.GimbalLimitRad) _aligned = true;
+            }
+
+            if (!_aligned)
+            {
+                double target = AttitudeController.VerticalTargetRad(position);
+                double delta = FlipControllerEnabled ? AttitudeController.Command(attitude, omegaZ, target) : 0d;
+                Vector3d direction = attitude.Rotate(CylinderInertia.BodyThrustDirection(delta));
+                return new TerminalCommand
+                {
+                    Phase = "Flip",
+                    Throttle = FlipThrottle,
+                    Direction = direction,
+                    PitchFromVerticalDeg = PitchFromVertical(direction, position),
+                    BodyThrust = true
                 };
             }
 
@@ -307,6 +319,10 @@ namespace MarsMission.PhysicsCore
                     Lerp(before.AngularVelocityBody.X, after.AngularVelocityBody.X, u),
                     Lerp(before.AngularVelocityBody.Y, after.AngularVelocityBody.Y, u),
                     Lerp(before.AngularVelocityBody.Z, after.AngularVelocityBody.Z, u)),
+                GimbalRad = before.GimbalRad,
+                ControllerEnabled = before.ControllerEnabled,
+                PitchTargetRad = before.PitchTargetRad,
+                FlipHold = before.FlipHold,
                 Attitude = QuaternionD.Slerp(before.Attitude, after.Attitude, u)
             };
         }

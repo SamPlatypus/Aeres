@@ -74,6 +74,10 @@ namespace MarsMission.PhysicsCore
         public double AlphaX;
         public double AlphaY;
         public double AlphaZ;
+        public double AngleOfAttackRad;
+        public double AeroMomentZ;
+        public double PitchAngleRad;
+        public bool ControllerEnabled;
 
         public string ToLogLine()
         {
@@ -131,7 +135,7 @@ namespace MarsMission.PhysicsCore
         {
             return string.Format(
                 CultureInfo.InvariantCulture,
-                " | qw={0:F9} | qx={1:F9} | qy={2:F9} | qz={3:F9} | wmag={4:F6} rad/s | theta={5:F9} rad | wx={6:F9} | wy={7:F9} | wz={8:F9} | L={9:F6} | Lix={10:F6} | Liy={11:F6} | Liz={12:F6} | Ixx={13:F3} | Iyy={14:F3} | Izz={15:F3} | gimbal={16:F9} rad | Mx={17:F3} | My={18:F3} | Mz={19:F3} | ax={20:F9} | ay={21:F9} | az={22:F9}",
+                " | qw={0:F9} | qx={1:F9} | qy={2:F9} | qz={3:F9} | wmag={4:F6} rad/s | theta={5:F9} rad | wx={6:F9} | wy={7:F9} | wz={8:F9} | L={9:F6} | Lix={10:F6} | Liy={11:F6} | Liz={12:F6} | Ixx={13:F3} | Iyy={14:F3} | Izz={15:F3} | gimbal={16:F9} rad | Mx={17:F3} | My={18:F3} | Mz={19:F3} | ax={20:F9} | ay={21:F9} | az={22:F9} | aoa={23:F9} rad | Maero={24:F3} | ctrl={25:0} | perr={26:F9} rad",
                 QuaternionW,
                 QuaternionX,
                 QuaternionY,
@@ -154,7 +158,11 @@ namespace MarsMission.PhysicsCore
                 MomentZ,
                 AlphaX,
                 AlphaY,
-                AlphaZ);
+                AlphaZ,
+                AngleOfAttackRad,
+                AeroMomentZ,
+                ControllerEnabled ? 1 : 0,
+                PitchAngleRad);
         }
     }
 
@@ -220,6 +228,17 @@ namespace MarsMission.PhysicsCore
 
         public static SimulationReport RunVerticalBurn(bool disableGravityAndAtmosphere, int substeps, Vector3d angularVelocityBody, double gimbalRad)
         {
+            return RunVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad, false, QuaternionD.Identity);
+        }
+
+        public static SimulationReport RunVerticalBurn(
+            bool disableGravityAndAtmosphere,
+            int substeps,
+            Vector3d angularVelocityBody,
+            double gimbalRad,
+            bool controllerEnabled,
+            QuaternionD initialAttitude)
+        {
             if (substeps < 1) throw new ArgumentOutOfRangeException("substeps");
 
             PlanetaryEnvironment env = PlanetaryEnvironment.CreateEarth(false);
@@ -230,6 +249,9 @@ namespace MarsMission.PhysicsCore
             VehicleState state = VehicleState.CreateSeaLevel(env);
             state.AngularVelocityBody = angularVelocityBody;
             state.GimbalRad = gimbalRad;
+            state.ControllerEnabled = controllerEnabled;
+            state.Attitude = initialAttitude;
+            state.InitialAttitude = initialAttitude;
             Vector3d initialVelocity = state.Velocity;
 
             int steps = (int)Math.Round(BurnDurationS * IntegratorRK4.StepHz);
@@ -312,6 +334,7 @@ namespace MarsMission.PhysicsCore
             PropulsionModel propulsion = PropulsionModel.CreateDefaultStage();
             IntegratorRK4 integrator = new IntegratorRK4(env, propulsion);
             VehicleState state = VehicleState.CreateSeaLevel(env);
+            state.ControllerEnabled = false;
             Vector3d initialVelocity = state.Velocity;
 
             int steps = (int)Math.Round(BurnDurationS * IntegratorRK4.StepHz);
@@ -409,6 +432,7 @@ namespace MarsMission.PhysicsCore
             PropulsionModel propulsion = PropulsionModel.CreateDefaultStage();
             IntegratorRK4 integrator = new IntegratorRK4(env, propulsion);
             VehicleState state = VehicleState.CreateSeaLevel(env);
+            state.ControllerEnabled = false;
             Vector3d initialVelocity = state.Velocity;
 
             int logEvery = (int)Math.Round(LogIntervalS * IntegratorRK4.StepHz);
@@ -511,6 +535,7 @@ namespace MarsMission.PhysicsCore
             PropulsionModel propulsion = PropulsionModel.CreateDefaultStage();
             IntegratorRK4 integrator = new IntegratorRK4(env, propulsion);
             VehicleState state = VehicleState.CreateSeaLevel(env);
+            state.ControllerEnabled = false;
             Vector3d initialVelocity = state.Velocity;
             double mu = env.GravityEnabled ? env.MuM3S2 : 0d;
 
@@ -788,9 +813,10 @@ namespace MarsMission.PhysicsCore
         {
             Vector3d direction = thrustDirection;
             double pitchDeg = thrustPitchDeg;
-            if (state.GimbalRad != 0d && throttle > 0d)
+            double gimbal = AttitudeController.EffectiveGimbal(state);
+            if (gimbal != 0d && throttle > 0d)
             {
-                direction = state.Attitude.Rotate(CylinderInertia.BodyThrustDirection(state.GimbalRad));
+                direction = state.Attitude.Rotate(CylinderInertia.BodyThrustDirection(gimbal));
                 pitchDeg = Math.Atan2(direction.X, direction.Y) * (180d / Math.PI);
             }
             ForceEvaluation force = integrator.Evaluate(state.Position, state.Velocity, state.PropellantMassKg, throttle, direction);
@@ -844,15 +870,24 @@ namespace MarsMission.PhysicsCore
             sample.InertiaIyy = inertia.Iyy;
             sample.InertiaIzz = inertia.Izz;
             sample.RotationAngleRad = QuaternionD.RotationAngleBetween(state.InitialAttitude, state.Attitude);
-            Vector3d moment = CylinderInertia.GimbalMoment(sample.ThrustN, state.GimbalRad);
+            Vector3d aero = AeroMoment.Moment(state.Attitude, state.Velocity, sample.DensityKgM3);
+            double gimbal = AttitudeController.EffectiveGimbal(state);
+            Vector3d gimbalTorque = CylinderInertia.GimbalMoment(sample.ThrustN, gimbal);
+            Vector3d moment = aero.X == 0d && aero.Y == 0d && aero.Z == 0d
+                ? gimbalTorque
+                : new Vector3d(gimbalTorque.X + aero.X, gimbalTorque.Y + aero.Y, gimbalTorque.Z + aero.Z);
             Vector3d alpha = CylinderInertia.EulerRate(state.AngularVelocityBody, inertia, moment);
-            sample.GimbalRad = state.GimbalRad;
+            sample.GimbalRad = gimbal;
             sample.MomentX = moment.X;
             sample.MomentY = moment.Y;
             sample.MomentZ = moment.Z;
             sample.AlphaX = alpha.X;
             sample.AlphaY = alpha.Y;
             sample.AlphaZ = alpha.Z;
+            sample.AngleOfAttackRad = AeroMoment.AngleOfAttackRad(AeroMoment.VelocityBody(state.Attitude, state.Velocity));
+            sample.AeroMomentZ = aero.Z;
+            sample.PitchAngleRad = AttitudeController.PitchErrorRad(state.Attitude, AttitudeController.PitchTargetRad);
+            sample.ControllerEnabled = state.ControllerEnabled;
         }
 
         private static void AdvanceAttitude(VehicleState state, double dt, int substeps)
@@ -884,6 +919,7 @@ namespace MarsMission.PhysicsCore
             PropulsionModel propulsion = PropulsionModel.CreateDefaultStage();
             IntegratorRK4 integrator = new IntegratorRK4(env, propulsion);
             VehicleState state = VehicleState.CreateSeaLevel(env);
+            state.ControllerEnabled = false;
             Vector3d initialVelocity = state.Velocity;
 
             int logEvery = (int)Math.Round(LogIntervalS * IntegratorRK4.StepHz);
@@ -941,6 +977,7 @@ namespace MarsMission.PhysicsCore
             PropulsionModel propulsion = PropulsionModel.CreateDefaultStage();
             IntegratorRK4 integrator = new IntegratorRK4(env, propulsion);
             VehicleState state = VehicleState.CreateEntry(env, altitudeM, speedMps, flightPathDeg, propellantKg);
+            state.ControllerEnabled = false;
             Vector3d initialVelocity = state.Velocity;
             double mu = env.GravityEnabled ? env.MuM3S2 : 0d;
 
@@ -1104,6 +1141,7 @@ namespace MarsMission.PhysicsCore
             PropulsionModel propulsion = PropulsionModel.CreateDefaultStage();
             IntegratorRK4 integrator = new IntegratorRK4(env, propulsion);
             VehicleState state = VehicleState.CreateEntry(env, entryAltitudeM, entrySpeedMps, entryFlightPathDeg, entryPropellantKg);
+            state.ControllerEnabled = false;
             Vector3d initialVelocity = state.Velocity;
 
             SimulationReport report = new SimulationReport();
@@ -1151,7 +1189,11 @@ namespace MarsMission.PhysicsCore
                 double height = env.AltitudeM(state.Position);
                 double speed = state.Velocity.Magnitude;
                 if (speed > peak) peak = speed;
-                TerminalCommand command = sequence.Command(timeS, state.Position, state.Velocity, state.PropellantMassKg, height);
+                TerminalCommand command = sequence.Command(timeS, state.Position, state.Velocity, state.PropellantMassKg, height, state.Attitude, state.AngularVelocityBody.Z);
+                bool flipping = command.BodyThrust && sequence.FlipControllerEnabled;
+                state.ControllerEnabled = flipping;
+                state.PitchTargetRad = flipping ? AttitudeController.VerticalTargetRad(state.Position) : 0d;
+                state.FlipHold = flipping;
                 bool phaseChanged = command.Phase != loggedPhase;
                 bool onLog = n % logEvery == 0;
                 if (onLog || phaseChanged)
@@ -1168,6 +1210,7 @@ namespace MarsMission.PhysicsCore
                     state.Position = radial;
                     if (state.Velocity.Magnitude > peak) peak = state.Velocity.Magnitude;
                     impact = TerminalSequence.Assess(state, peak);
+                    if (command.Phase == "Flip") impact.Flag = "RUD";
                     impacted = true;
                     endTimeS = timeS;
                     TelemetrySample hit = CaptureTerminal(integrator, state, timeS, ImpactCommand(sequence, state, command), impact, peak);
@@ -1192,8 +1235,9 @@ namespace MarsMission.PhysicsCore
                     endTimeS = timeS + u * dt;
                     if (state.Velocity.Magnitude > peak) peak = state.Velocity.Magnitude;
                     impact = TerminalSequence.Assess(state, peak);
+                    if (command.Phase == "Flip") impact.Flag = "RUD";
                     impacted = true;
-                    TerminalCommand hitCommand = sequence.Command(endTimeS, state.Position, state.Velocity, state.PropellantMassKg, 0d);
+                    TerminalCommand hitCommand = sequence.Command(endTimeS, state.Position, state.Velocity, state.PropellantMassKg, 0d, state.Attitude, state.AngularVelocityBody.Z);
                     TelemetrySample hit = CaptureTerminal(integrator, state, endTimeS, ImpactCommand(sequence, state, hitCommand), impact, peak);
                     report.Samples.Add(hit);
                     Write(report, hit.ToLogLine());

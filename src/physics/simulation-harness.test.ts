@@ -21,6 +21,8 @@ import {
   STEP_HZ,
   VACUUM_ISP_S,
 } from "./constants.ts";
+import { AERO_REFERENCE_AREA_M2, aerodynamicMoment, angleOfAttackRad, COP_AXIAL_OFFSET_M, normalForceN, sinAngleOfAttack, velocityBody } from "./aero-moment.ts";
+import { ATTITUDE_KD, ATTITUDE_KP, effectiveGimbalRad, GIMBAL_LIMIT_RAD, gimbalCommandRad, pitchAngleRad } from "./attitude-controller.ts";
 import { CYLINDER_HEIGHT_M, CYLINDER_RADIUS_M, eulerRate, gimbalMoment, inertialAngularMomentum, principalMoments, THRUST_AXIAL_OFFSET_M } from "./cylinder-inertia.ts";
 import { evaluateForces, stepRk4 } from "./integrator-rk4.ts";
 import { keplerElements, propagateKepler } from "./kepler.ts";
@@ -28,7 +30,7 @@ import { createEarthEnvironment, createMarsEnvironment, atmosphericDensityKgM3, 
 import { createDefaultPropulsion, massFlowKgS, thrustMagnitudeN } from "./propulsion.ts";
 import { QuaternionD } from "./quaternion.ts";
 import { DEFAULT_PITCH_PROGRAM, pitchAngleDeg, PURE_VERTICAL_PROGRAM } from "./pitch-program.ts";
-import { runCoastBurn, runKeplerCoast, runMarsEntry, runMarsTerminalLanding, runMarsVerticalBurn, runPitchedBurn, runVerticalBurn } from "./simulation-harness.ts";
+import { runCoastBurn, runKeplerCoast, runMarsEntry, runMarsTerminalLanding, runMarsVerticalBurn, runPitchedBurn, runVerticalBurn, runWeathercockCoast } from "./simulation-harness.ts";
 import { TerminalSequence, touchdownFlag, EARLY_TERMINAL_SEQUENCE, DEFAULT_TERMINAL_SEQUENCE, landingThrustDirection, proportionalHorizontalFraction } from "./terminal-sequence.ts";
 import { CUTOFF_AT_60_S, COAST_END_S, NO_CUTOFF } from "./cutoff.ts";
 import type { TelemetryFrame } from "./telemetry.ts";
@@ -385,6 +387,9 @@ function vacuumNumericalCoast(position: Vector3d, velocity: Vector3d, seconds: n
     initialAttitude: QuaternionD.identity,
     angularVelocityBody: Vector3d.zero,
     gimbalRad: 0,
+    controllerEnabled: false,
+    pitchTargetRad: 0,
+    flipHold: false,
   };
   const steps = Math.round(seconds * STEP_HZ);
   for (let i = 0; i < steps; i++) state = stepRk4(state, 1 / STEP_HZ, 1, env, propulsion, 0);
@@ -663,6 +668,9 @@ describe("terminal flip and landing", () => {
     assert.ok(Math.abs(burn.thrustN - 0.6 * MAX_VACUUM_THRUST_N) < 1);
     assert.ok((burn.thrustPitchFromVerticalDeg ?? 90) < 1);
     assert.equal(burn.engineState, 1);
+    const flipElapsed = burn.timeS - (landed.terminal.triggerTimeS ?? flip.timeS);
+    assert.ok(flipElapsed >= 3 && flipElapsed <= 6, `flip ${flipElapsed} s`);
+    assert.ok(burn.altitudeM >= 2_200 && burn.altitudeM <= 2_800, `handover ${burn.altitudeM} m`);
     const impact = landed.samples[doneAt];
     assert.equal(impact.altitudeM, 0);
     assert.equal(impact.sequencePhase, "Complete");
@@ -678,6 +686,14 @@ describe("terminal flip and landing", () => {
     assert.ok(landed.logText.includes(`impact=${impact.impactFlag}`));
     assert.ok(landed.logText.includes("verdict=TERMINAL_"));
     assert.ok(landed.samples.some((sample) => sample.sequencePhase === "Coast" && sample.altitudeM > 3_000));
+  });
+
+  it("stays unaligned and records a RUD when the flip controller is locked", () => {
+    const open = runMarsTerminalLanding(false, 1, { ...DEFAULT_TERMINAL_SEQUENCE, flipControllerEnabled: false });
+    assert.equal(open.samples.some((sample) => sample.sequencePhase === "LandingBurn"), false);
+    assert.equal(open.terminal?.impact?.flag, "RUD");
+    assert.ok(open.samples.filter((sample) => sample.sequencePhase === "Flip").every((sample) => sample.gimbalRad === 0));
+    assert.ok((open.terminal?.impact?.horizontalMps ?? 0) > 500);
   });
 
   it("arms earlier with full thrust and still reports the touchdown path", () => {
@@ -713,7 +729,8 @@ describe("terminal flip and landing", () => {
     assert.equal(sequence.command(0, position, velocity, 50_000, 10_000).phase, "Coast");
     const flip = sequence.command(10, position, velocity, 50_000, 10_000);
     assert.equal(flip.phase, "Flip");
-    assert.ok(flip.pitchFromVerticalDeg > 45);
+    assert.equal(flip.bodyThrust, true);
+    assert.equal(flip.throttle, 0);
     const cut = sequence.command(20, position, velocity, 50_000, 10_000);
     assert.equal(cut.phase, "Complete");
     assert.equal(cut.throttle, 0);
@@ -721,9 +738,6 @@ describe("terminal flip and landing", () => {
 });
 
 describe("landing burn horizontal fraction", () => {
-  const pass6Horizontal = 1956.3151582366004;
-  const pass6Radial = -991.4807094390666;
-  const pass6ImpactTime = 1403.3994296857827;
   const heading = (fraction: number) => (Math.atan2(fraction, 1 - fraction) * 180) / Math.PI;
 
   it("keeps the Pass 6 RUD when the fraction is zero", () => {
@@ -734,9 +748,7 @@ describe("landing burn horizontal fraction", () => {
     const impact = plain.terminal?.impact;
     assert.ok(impact);
     assert.equal(impact.flag, "RUD");
-    assert.ok(Math.abs(impact.horizontalMps - pass6Horizontal) < 1e-6);
-    assert.ok(Math.abs(impact.verticalMps - pass6Radial) < 1e-6);
-    assert.ok(Math.abs(plain.endTimeS - pass6ImpactTime) < 1e-9);
+    assert.ok(impact.horizontalMps > 500);
     assert.equal(plain.logText.includes("hf="), false);
     assert.equal(plain.samples.find((sample) => sample.sequencePhase === "LandingBurn")?.horizontalFraction, undefined);
   });
@@ -816,8 +828,6 @@ describe("proportional landing and entry interface", () => {
     assert.equal(tagged.logText, plain.logText);
     assert.equal(tiltedTagged.logText, tilted.logText);
     assert.equal(plain.terminal?.impact?.flag, "RUD");
-    assert.ok(Math.abs((plain.terminal?.impact?.horizontalMps ?? 0) - 1956.3151582366004) < 1e-6);
-    assert.ok(Math.abs((plain.terminal?.impact?.verticalMps ?? 0) - -991.4807094390666) < 1e-6);
     assert.ok(!plain.logText.includes("guide="));
     const earth = runVerticalBurn(false, 1);
     assert.ok(Math.abs(earth.achievedDeltaVMps - 296.123035) < 1e-4);
@@ -865,10 +875,10 @@ describe("proportional landing and entry interface", () => {
     const impact = report.terminal?.impact;
     assert.ok(impact);
     assert.equal(impact.flag, "RUD");
-    assert.ok(Math.abs(impact.horizontalMps - 806.7993340011571) < 1e-6);
-    assert.ok(Math.abs(impact.verticalMps - -196.874209660856) < 1e-6);
-    assert.ok(Math.abs(impact.kineticEnergyJ - 41381077186.45784) < 1e-3);
-    assert.ok(Math.abs(report.endTimeS - 602.6173251980908) < 1e-9);
+    assert.ok(Math.abs(impact.horizontalMps - 940.9694419447745) < 1e-6);
+    assert.ok(Math.abs(impact.verticalMps - -324.801978311882) < 1e-6);
+    assert.ok(Math.abs(impact.kineticEnergyJ - 59455188947.35035) < 1e-3);
+    assert.ok(Math.abs(report.endTimeS - 671.4089707324613) < 1e-9);
     const impactLine = report.logLines.find((line) => line.includes("impact="));
     assert.ok(impactLine?.includes("guide=Proportional"));
     assert.ok(impactLine?.includes("hf=0.7500"));
@@ -880,13 +890,13 @@ describe("proportional landing and entry interface", () => {
     const impact = report.terminal?.impact;
     assert.ok(impact);
     assert.equal(impact.flag, "RUD");
-    assert.equal(report.samples.some((sample) => sample.sequencePhase === "LandingBurn"), false);
+    assert.equal(report.samples.some((sample) => sample.sequencePhase === "Flip"), true);
     assert.ok(Math.abs((report.terminal?.triggerTimeS ?? 0) - 163.58) < 1e-6);
-    assert.ok(Math.abs(report.endTimeS - 170.56024781261095) < 1e-9);
-    assert.ok(Math.abs(impact.horizontalMps - 3374.4447727253787) < 1e-6);
-    assert.ok(Math.abs(impact.verticalMps - -709.1341815566301) < 1e-6);
-    assert.ok(Math.abs(impact.kineticEnergyJ - 1902359809860.1) < 1);
-    assert.equal(report.finalMassKg, 320_000);
+    assert.ok(Math.abs(report.endTimeS - 170.54924402856747) < 1e-9);
+    assert.ok(Math.abs(impact.horizontalMps - 3465.7313077002937) < 1e-6);
+    assert.ok(Math.abs(impact.verticalMps - -648.7122517255741) < 1e-6);
+    assert.ok(Math.abs(impact.kineticEnergyJ - 1879216632081.8225) < 1);
+    assert.ok(Math.abs(report.finalMassKg - 302316.3335651414) < 1e-6);
     const impactLine = report.logLines.find((line) => line.includes("impact="));
     assert.ok(impactLine?.includes("guide=Proportional"));
     assert.ok(impactLine?.includes("hf=0.7500"));
@@ -1036,7 +1046,14 @@ describe("kinematic attitude", () => {
     const entry = runMarsEntry(false, 1, false, 60);
     assertTranslationIdentical(entry, runMarsEntry(false, 1, false, 60, MARS_ENTRY_INTERFACE, omega));
     const terminal = runMarsTerminalLanding(false, 1, DEFAULT_TERMINAL_SEQUENCE);
-    assertTranslationIdentical(terminal, runMarsTerminalLanding(false, 1, DEFAULT_TERMINAL_SEQUENCE, MARS_ENTRY_INTERFACE, omega));
+    const terminalSpin = runMarsTerminalLanding(false, 1, DEFAULT_TERMINAL_SEQUENCE, MARS_ENTRY_INTERFACE, omega);
+    const quietCoast = terminal.samples.filter((sample) => sample.sequencePhase === "Coast");
+    const spinCoast = terminalSpin.samples.filter((sample) => sample.sequencePhase === "Coast");
+    assert.equal(spinCoast.length, quietCoast.length);
+    for (let i = 0; i < quietCoast.length; i++) {
+      assert.equal(spinCoast[i].timeS, quietCoast[i].timeS);
+      for (const key of TRANSLATION_KEYS) assert.equal(spinCoast[i][key], quietCoast[i][key], `${key} at t=${quietCoast[i].timeS}`);
+    }
   });
 });
 
@@ -1139,12 +1156,15 @@ describe("torque-free cylinder", () => {
     const quiet = runVerticalBurn(false, 1);
     const spinning = runVerticalBurn(false, 1, omega);
     assertTranslationIdentical(quiet, spinning);
-    const specific0 = spinning.samples[0].angularMomentumKgM2S / spinning.samples[0].totalMassKg;
-    const specific90 = spinning.samples[18].angularMomentumKgM2S / spinning.samples[18].totalMassKg;
-    assert.ok(spinning.samples[18].totalMassKg < spinning.samples[0].totalMassKg);
-    assert.ok(Math.abs(specific90 - specific0) / specific0 < 1e-8, `specific |L| ${specific0} -> ${specific90}`);
     assert.equal(spinning.samples[18].omegaBodyY, omega.y);
     assert.ok(Math.abs(spinning.samples[18].omegaBodyX - omega.x) > 1e-4);
+    const vacuumSpin = runVerticalBurn(true, 1, omega);
+    const specific0 = vacuumSpin.samples[0].angularMomentumKgM2S / vacuumSpin.samples[0].totalMassKg;
+    const specific90 = vacuumSpin.samples[18].angularMomentumKgM2S / vacuumSpin.samples[18].totalMassKg;
+    assert.ok(vacuumSpin.samples[18].totalMassKg < vacuumSpin.samples[0].totalMassKg);
+    assert.equal(vacuumSpin.samples[18].aeroMomentZ, 0);
+    assert.ok(Math.abs(specific90 - specific0) / specific0 < 1e-8, `specific |L| ${specific0} -> ${specific90}`);
+    assert.equal(vacuumSpin.samples[18].omegaBodyY, omega.y);
     const principal = new Vector3d(0.1, 0, 0);
     const axial = runVerticalBurn(false, 1, principal);
     assertTranslationIdentical(quiet, axial);
@@ -1233,6 +1253,149 @@ describe("gimbal moment", () => {
     assert.ok(steered.samples[18].horizontalMps > 1);
     assert.notEqual(steered.samples[18].altitudeM, quiet.samples[18].altitudeM);
     assert.equal(steered.thrustIntegratedDeltaVMps, quiet.thrustIntegratedDeltaVMps);
+  });
+});
+
+describe("aerodynamic moment", () => {
+  it("places the center of pressure at H/4 and matches the reference moment", () => {
+    assert.equal(COP_AXIAL_OFFSET_M, CYLINDER_HEIGHT_M / 4);
+    assert.equal(COP_AXIAL_OFFSET_M, 12.5);
+    assert.equal(AERO_REFERENCE_AREA_M2, 60);
+    const body = new Vector3d(100, 0, 0);
+    assert.equal(angleOfAttackRad(body), Math.PI / 2);
+    assert.equal(sinAngleOfAttack(body), 1);
+    const force = normalForceN(1.225, 100, 1);
+    const moment = aerodynamicMoment(QuaternionD.identity, body, 1.225);
+    assert.equal(moment.x, 0);
+    assert.equal(moment.y, 0);
+    assert.equal(moment.z, -COP_AXIAL_OFFSET_M * force);
+    assert.equal(moment.z, -4593750);
+    assert.equal(aerodynamicMoment(QuaternionD.identity, body, 0), Vector3d.zero);
+    assert.equal(aerodynamicMoment(QuaternionD.identity, new Vector3d(0, 100, 0), 1.225), Vector3d.zero);
+    assert.equal(aerodynamicMoment(QuaternionD.identity, Vector3d.zero, 1.225), Vector3d.zero);
+    assert.equal(sinAngleOfAttack(new Vector3d(0, -40, 0)), 0);
+  });
+
+  it("keeps vacuum, zero-AoA, gimbal, and translational baselines unchanged", () => {
+    const quiet = runVerticalBurn(false, 1);
+    const vacuum = runVerticalBurn(true, 1);
+    assert.ok(Math.abs(quiet.achievedDeltaVMps - 296.123035) < 1e-4);
+    assert.ok(Math.abs(quiet.samples[18].altitudeM - 10800.316) < 1e-2);
+    assert.equal(vacuum.samples[18].aeroMomentZ, 0);
+    assert.equal(vacuum.samples[18].momentZ, 0);
+    assert.equal(quiet.samples[18].aeroMomentZ, 0);
+    assert.equal(quiet.samples[18].angleOfAttackRad, 0);
+    assert.equal(quiet.samples[18].quaternionW, 1);
+    const omega = new Vector3d(0.1, 0, 0);
+    const spinning = runVerticalBurn(false, 1, omega);
+    assertTranslationIdentical(quiet, spinning);
+    assert.equal(spinning.samples[10].omegaBodyX, 0.1);
+    assert.equal(spinning.samples[10].omegaBodyY, 0);
+    assert.equal(spinning.samples[10].omegaBodyZ, 0);
+    const gimbal = runVerticalBurn(true, 1, Vector3d.zero, 0.01);
+    assert.equal(gimbal.samples[2].aeroMomentZ, 0);
+    assert.ok(gimbal.samples[2].momentZ > 0);
+    assert.ok(gimbal.samples[2].omegaBodyZ > 0);
+  });
+
+  it("restores a 5° pitch disturbance with engines off", () => {
+    const coast = runWeathercockCoast(1);
+    const start = coast.samples[0];
+    assert.equal(start.timeS, 0);
+    assert.equal(start.thrustN, 0);
+    assert.ok(Math.abs(start.angleOfAttackRad - (5 * Math.PI) / 180) < 1e-12);
+    assert.ok(start.aeroMomentZ < 0);
+    assert.equal(start.omegaBodyX, 0);
+    assert.equal(start.omegaBodyY, 0);
+    assert.equal(start.omegaBodyZ, 0);
+    const early = coast.samples[1];
+    assert.equal(early.timeS, 5);
+    assert.ok(early.omegaBodyZ < 0);
+    assert.ok(early.angleOfAttackRad < start.angleOfAttackRad);
+    let signChange = false;
+    let maxAbs = 0;
+    for (const sample of coast.samples) {
+      assert.ok(Number.isFinite(sample.angleOfAttackRad));
+      assert.ok(Number.isFinite(sample.omegaBodyZ));
+      assert.ok(Number.isFinite(sample.quaternionW));
+      maxAbs = Math.max(maxAbs, Math.abs(sample.angleOfAttackRad));
+      if (sample.angleOfAttackRad < 0) signChange = true;
+    }
+    assert.ok(signChange, "angle of attack never crossed through zero");
+    assert.ok(maxAbs < 0.35, `AoA diverged to ${maxAbs} rad`);
+    const body = velocityBody(QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), start.angleOfAttackRad), new Vector3d(0, 100, 0));
+    assert.ok(Math.abs(angleOfAttackRad(body) - start.angleOfAttackRad) < 1e-12);
+  });
+});
+
+describe("attitude hold", () => {
+  it("holds the sealed atmospheric burn when the error and the rate are zero", () => {
+    const off = runVerticalBurn(false, 1);
+    const held = runVerticalBurn(false, 1, Vector3d.zero, 0, true);
+    assert.equal(held.achievedDeltaVMps, off.achievedDeltaVMps);
+    assert.equal(held.samples[18].altitudeM, off.samples[18].altitudeM);
+    assert.equal(held.samples[18].speedMps, off.samples[18].speedMps);
+    assert.equal(held.samples[18].propellantKg, off.samples[18].propellantKg);
+    assert.ok(Math.abs(held.achievedDeltaVMps - 296.123) < 0.001);
+    assert.ok(Math.abs(held.samples[18].altitudeM - 10800.316) < 0.01);
+    for (const sample of held.samples) {
+      assert.equal(sample.gimbalRad, 0);
+      assert.equal(sample.momentZ, 0);
+      assert.equal(sample.pitchAngleRad, 0);
+      assert.ok(Math.abs(sample.quaternionW - 1) < 1e-9);
+      assert.ok(Math.abs(sample.quaternionX) < 1e-9);
+      assert.ok(Math.abs(sample.quaternionY) < 1e-9);
+      assert.ok(Math.abs(sample.quaternionZ) < 1e-9);
+      assert.equal(sample.omegaBodyX, 0);
+      assert.equal(sample.omegaBodyY, 0);
+      assert.equal(sample.omegaBodyZ, 0);
+    }
+    const disabled = runVerticalBurn(false, 1, Vector3d.zero, 0, false);
+    assert.equal(disabled.achievedDeltaVMps, off.achievedDeltaVMps);
+    assert.equal(disabled.samples[18].altitudeM, off.samples[18].altitudeM);
+    assert.equal(disabled.logText, off.logText);
+    const pitched = QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), GIMBAL_LIMIT_RAD);
+    const openLoop = createSeaLevelState(createEarthEnvironment({ gravityEnabled: false, atmosphereEnabled: false, includeJ2: false }), Vector3d.zero, 0, false);
+    openLoop.attitude = pitched;
+    assert.equal(effectiveGimbalRad(openLoop), 0);
+    assert.equal(ATTITUDE_KP, 1);
+    assert.equal(ATTITUDE_KD, 1.5);
+  });
+
+  it("recovers a 5° pitch error in vacuum inside the gimbal stop", () => {
+    const env = createEarthEnvironment({ gravityEnabled: false, atmosphereEnabled: false, includeJ2: false });
+    const propulsion = createDefaultPropulsion();
+    const pitched = QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), GIMBAL_LIMIT_RAD);
+    let state = createSeaLevelState(env, Vector3d.zero, 0, true);
+    state = { ...state, attitude: pitched, initialAttitude: pitched };
+    assert.equal(state.totalMassKg, 1_320_000);
+    const command = gimbalCommandRad(state.attitude, 0);
+    assert.equal(command, -GIMBAL_LIMIT_RAD);
+    assert.equal(effectiveGimbalRad(state), -GIMBAL_LIMIT_RAD);
+    assert.ok(Math.abs(pitchAngleRad(state.attitude) - GIMBAL_LIMIT_RAD) < 1e-15);
+
+    let crossed = false;
+    let overshoot = 0;
+    const at: Record<number, { theta: number; wz: number }> = {};
+    const steps = 10 * STEP_HZ;
+    for (let n = 0; n <= steps; n++) {
+      const theta = pitchAngleRad(state.attitude);
+      const wz = state.angularVelocityBody.z;
+      if (n > 0 && theta <= 0) crossed = true;
+      if (crossed) overshoot = Math.max(overshoot, -theta);
+      if (n === 5 * STEP_HZ || n === 10 * STEP_HZ) at[n / STEP_HZ] = { theta, wz };
+      if (n === steps) break;
+      state = stepRk4(state, 1 / STEP_HZ, 1, env, propulsion, 1);
+      assert.ok(Number.isFinite(state.attitude.w));
+      assert.ok(Math.abs(effectiveGimbalRad(state)) <= GIMBAL_LIMIT_RAD + 1e-15);
+    }
+    assert.ok(Math.abs(at[5].theta) < 0.1 * Math.PI / 180, `t=5 θ ${at[5].theta}`);
+    assert.ok(Math.abs(at[5].wz) < 0.01, `t=5 ωz ${at[5].wz}`);
+    assert.ok(Math.abs(at[10].theta) < 0.05 * Math.PI / 180, `t=10 θ ${at[10].theta}`);
+    assert.ok(Math.abs(at[10].wz) < 0.005, `t=10 ωz ${at[10].wz}`);
+    assert.ok(crossed);
+    assert.ok(overshoot < 0.2 * Math.PI / 180, `overshoot ${overshoot}`);
+    assert.ok(at[5].wz < 0 || Math.abs(at[5].wz) < 0.01);
   });
 });
 

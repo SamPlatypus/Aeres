@@ -1,0 +1,22 @@
+Continue from the verified ARES CORE engine (translational, Euler tumbling, aerodynamic moment, and PD gimbal controller). Do not alter any prior verified physics results.
+
+Replace the open-loop / kinematic Mars flip with a finite-time, torque-driven powered flip using the verified PD gimbal controller.
+
+1. Physics & Controller Integration
+- On Mars terminal descent, trigger the flip sequence at altitude h <= 3,000 m.
+- During the flip phase, set engine throttle to FlipThrottle = 0.6 (60% thrust). Thrust acts along body +Y at nozzle offset r = (0, -25.0, 0) m.
+- The verified PD pitch loop commands gimbal deflection δ = −(1.0 · θ_err + 1.5 · ω_z) clamped to ±5.0°, producing restoring moment M_z = 25.0 · T · sin δ about the center of mass.
+- θ_err is the signed pitch error between the vehicle body axis (+Y) and the local vertical vector (upward surface normal).
+- The vehicle transitions from Flip to LandingBurn only when |θ_err| <= 5.0°.
+- If the vehicle reaches terrain altitude (h <= 0) before achieving the 5.0° alignment gate, evaluate the landing as an unaligned impact (RUD).
+- Nominal touchdown criteria remain intact: vertical speed <= 2.0 m/s and horizontal speed <= 0.5 m/s.
+
+2. Verification & Regression Assertions
+- Mars Rotation Window: On nominal Mars entry at the 3,000 m trigger, active torque-driven rotation reaches |θ_err| <= 5.0° within 3.0 s to 6.0 s elapsed time, transitioning to LandingBurn at an altitude between 2,200 m and 2,800 m.
+- Controller-Off Check: Disabling the flip controller (or locking δ = 0) causes the vehicle to maintain near-entry attitude and impact the surface unaligned as a confirmed RUD.
+- Baseline Isolation: All prior verified cases must remain identical:
+  * 90 s Earth ascent: Δv = 296.123 m/s, altitude = 10,800.316 m, identity quaternion, ω = 0.
+  * Static aerodynamic moment: M_z = −4,593,750 N·m at ρ = 1.225 kg/m³, 100 m/s, α = 90°.
+  * Vacuum PD recovery: +5° pitch error settles under 0.10° at 5 s and under 0.05° at 10 s.
+
+Extend only. Complete C# 9. No placeholders.

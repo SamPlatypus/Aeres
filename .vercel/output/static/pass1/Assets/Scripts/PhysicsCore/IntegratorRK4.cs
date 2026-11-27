@@ -139,15 +139,19 @@ namespace MarsMission.PhysicsCore
         private void Rk4(VehicleState state, double dt, double throttle, Vector3d thrustDirection)
         {
             Vector3d direction = thrustDirection;
-            if (state.GimbalRad != 0d && throttle > 0d)
+            double gimbal = AttitudeController.EffectiveGimbal(state);
+            if (gimbal != 0d && throttle > 0d)
             {
-                direction = state.Attitude.Rotate(CylinderInertia.BodyThrustDirection(state.GimbalRad));
+                direction = state.Attitude.Rotate(CylinderInertia.BodyThrustDirection(gimbal));
             }
 
             Vector3d r0 = state.Position;
             Vector3d v0 = state.Velocity;
             double p0 = state.PropellantMassKg;
             double s0 = state.ThrustIntegratedDeltaVMps;
+            Vector3d aero = state.FlipHold
+                ? Vector3d.Zero
+                : AeroMoment.Moment(state.Attitude, v0, _environment.AtmosphericDensityKgM3(r0));
 
             Deriv k1 = DerivOf(r0, v0, p0, throttle, direction);
             Deriv k2 = DerivOf(
@@ -178,24 +182,43 @@ namespace MarsMission.PhysicsCore
             if (state.PropellantMassKg < 0d) state.PropellantMassKg = 0d;
             state.TotalMassKg = VehicleState.DryMassKg + state.PropellantMassKg;
 
-            if (state.GimbalRad != 0d)
+            bool aeroOn = aero.X != 0d || aero.Y != 0d || aero.Z != 0d;
+            if (!aeroOn)
             {
-                double thrust = _propulsion.ThrustMagnitudeN(throttle, state.PropellantMassKg);
-                Vector3d moment = CylinderInertia.GimbalMoment(thrust, state.GimbalRad);
-                if (moment.SqrMagnitude != 0d || !QuaternionD.AngularVelocityIsZero(state.AngularVelocityBody))
+                if (gimbal != 0d)
+                {
+                    double thrust = _propulsion.ThrustMagnitudeN(throttle, state.PropellantMassKg);
+                    Vector3d moment = CylinderInertia.GimbalMoment(thrust, gimbal);
+                    if (moment.SqrMagnitude != 0d || !QuaternionD.AngularVelocityIsZero(state.AngularVelocityBody))
+                    {
+                        QuaternionD attitude = state.Attitude;
+                        Vector3d omega = state.AngularVelocityBody;
+                        CylinderInertia.IntegrateRk4(ref attitude, ref omega, state.TotalMassKg, dt, moment);
+                        state.Attitude = attitude;
+                        state.AngularVelocityBody = omega;
+                    }
+                }
+                else if (!QuaternionD.AngularVelocityIsZero(state.AngularVelocityBody))
                 {
                     QuaternionD attitude = state.Attitude;
                     Vector3d omega = state.AngularVelocityBody;
-                    CylinderInertia.IntegrateRk4(ref attitude, ref omega, state.TotalMassKg, dt, moment);
+                    CylinderInertia.IntegrateRk4(ref attitude, ref omega, state.TotalMassKg, dt);
                     state.Attitude = attitude;
                     state.AngularVelocityBody = omega;
                 }
             }
-            else if (!QuaternionD.AngularVelocityIsZero(state.AngularVelocityBody))
+            else
             {
+                Vector3d moment = aero;
+                if (gimbal != 0d)
+                {
+                    double thrust = _propulsion.ThrustMagnitudeN(throttle, state.PropellantMassKg);
+                    Vector3d thrustMoment = CylinderInertia.GimbalMoment(thrust, gimbal);
+                    moment = new Vector3d(thrustMoment.X + aero.X, thrustMoment.Y + aero.Y, thrustMoment.Z + aero.Z);
+                }
                 QuaternionD attitude = state.Attitude;
                 Vector3d omega = state.AngularVelocityBody;
-                CylinderInertia.IntegrateRk4(ref attitude, ref omega, state.TotalMassKg, dt);
+                CylinderInertia.IntegrateRk4(ref attitude, ref omega, state.TotalMassKg, dt, moment);
                 state.Attitude = attitude;
                 state.AngularVelocityBody = omega;
             }

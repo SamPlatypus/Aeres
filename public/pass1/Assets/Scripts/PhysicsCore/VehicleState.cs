@@ -34,8 +34,17 @@ namespace MarsMission.PhysicsCore
         /// <summary>Body-frame angular velocity, rad/s. Torque-free Euler when the gimbal is zero.</summary>
         public Vector3d AngularVelocityBody = Vector3d.Zero;
 
-        /// <summary>Constant deflection of thrust from body +Y toward +X, radians. Zero keeps Pass 10.</summary>
+        /// <summary>Constant deflection of thrust from body +Y toward +X, radians. Zero keeps Pass 10. Ignored while the controller is on.</summary>
         public double GimbalRad = 0d;
+
+        /// <summary>Pitch PD commands the gimbal. Off leaves GimbalRad as the open-loop deflection. Defaults to armed.</summary>
+        public bool ControllerEnabled = true;
+
+        /// <summary>Inertial pitch the PD holds. Zero keeps the Earth vertical target.</summary>
+        public double PitchTargetRad = 0d;
+
+        /// <summary>Powered flip. Rotational torque is the gimbal moment only. Every other path leaves this false.</summary>
+        public bool FlipHold = false;
 
         public static VehicleState CreateSeaLevel(PlanetaryEnvironment environment)
         {
@@ -89,7 +98,10 @@ namespace MarsMission.PhysicsCore
                 Attitude = Attitude,
                 InitialAttitude = InitialAttitude,
                 AngularVelocityBody = AngularVelocityBody,
-                GimbalRad = GimbalRad
+                GimbalRad = GimbalRad,
+                ControllerEnabled = ControllerEnabled,
+                PitchTargetRad = PitchTargetRad,
+                FlipHold = FlipHold
             };
         }
     }

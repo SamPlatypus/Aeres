@@ -42,10 +42,10 @@ export const MARS_ENTRY_PROPELLANT_KG = 50_000;
 export const MARS_SURFACE_BURN_S = 60;
 export const MARS_ENTRY_END_S = 300;
 
-/** Open-loop terminal sequence. Used only when that mode is armed on a Mars entry. */
+/** Powered terminal sequence. Used only when that mode is armed on a Mars entry. */
 export const TERMINAL_TRIGGER_ALTITUDE_M = 3_000;
 export const TERMINAL_FLIP_DURATION_S = 8;
-export const TERMINAL_FLIP_THROTTLE = 0;
+export const TERMINAL_FLIP_THROTTLE = 0.6;
 export const TERMINAL_LANDING_THROTTLE = 0.6;
 export const TERMINAL_NOMINAL_VERTICAL_MPS = 2;
 export const TERMINAL_NOMINAL_HORIZONTAL_MPS = 0.5;

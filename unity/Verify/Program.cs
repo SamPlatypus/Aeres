@@ -172,6 +172,8 @@ internal static class Program
         bool sawFlip = false;
         bool sawBurn = false;
         double flipAltitude = -1d;
+        double burnAltitude = -1d;
+        double burnTime = -1d;
         double burnThrust = -1d;
         for (int i = 0; i < terminal.Samples.Count; i++)
         {
@@ -184,16 +186,44 @@ internal static class Program
             {
                 sawBurn = true;
                 burnThrust = terminal.Samples[i].ThrustN;
+                burnAltitude = terminal.Samples[i].AltitudeM;
+                burnTime = terminal.Samples[i].TimeS;
             }
+        }
+        double flipElapsed = burnTime - terminal.TriggerTimeS;
+        TerminalSequence locked = new TerminalSequence(
+            TerminalSequence.DefaultTriggerAltitudeM,
+            null,
+            TerminalSequence.DefaultFlipDurationS,
+            TerminalSequence.DefaultFlipThrottle,
+            TerminalSequence.DefaultLandingThrottle,
+            null,
+            0d,
+            "FixedFraction",
+            1d,
+            500d,
+            0.75d,
+            false);
+        SimulationReport openLoop = SimulationHarness.RunMarsTerminalLanding(false, 1, locked);
+        bool openBurn = false;
+        for (int i = 0; i < openLoop.Samples.Count; i++)
+        {
+            if (openLoop.Samples[i].SequencePhase == "LandingBurn") openBurn = true;
         }
         TelemetrySample terminalLast = terminal.Samples[terminal.Samples.Count - 1];
         bool caseTerminal = sawFlip
             && sawBurn
             && flipAltitude <= 3_000d
             && flipAltitude > 2_500d
+            && flipElapsed >= 3d
+            && flipElapsed <= 6d
+            && burnAltitude >= 2_200d
+            && burnAltitude <= 2_800d
             && Math.Abs(burnThrust - 0.6d * 15_000_000d) < 1d
             && terminalLast.AltitudeM == 0d
             && (terminal.ImpactFlag == "RUD" || terminal.ImpactFlag == "nominal")
+            && !openBurn
+            && openLoop.ImpactFlag == "RUD"
             && terminalEarly.Samples[0].SequencePhase == "Coast"
             && terminalEarly.TriggerTimeS < terminal.TriggerTimeS
             && Math.Abs(earth.AchievedDeltaVMps - 296.123d) < 0.001d;
@@ -289,7 +319,9 @@ internal static class Program
         bool spinSub = SpinPrincipal(new Vector3d(0.1d, 0d, 0d), 10d, 4);
         bool euler = VerifyTorqueFree(earth, spinning);
         bool gimbal = VerifyGimbal(earth);
-        pass = pass && attitudeQuiet && attitudeTranslation && spin10 && spin30 && spinY && spinZ && spinSub && euler && gimbal;
+        bool aero = VerifyAero(earth, vacuum);
+        bool hold = VerifyAttitudeHold(earth);
+        pass = pass && attitudeQuiet && attitudeTranslation && spin10 && spin30 && spinY && spinZ && spinSub && euler && gimbal && aero && hold;
         Console.WriteLine(pass ? "VERIFY PASS" : "VERIFY FAIL");
         if (pass)
         {
@@ -489,6 +521,174 @@ internal static class Program
         if (!ok)
         {
             Console.WriteLine("GIMBAL FAIL geometry=" + geometry + " integrated=" + integrated + " recovered=" + recovered + " tilts=" + tilts + " spin=" + spinMatch);
+        }
+        return ok;
+    }
+
+    /// <summary>
+    /// Aerodynamic moment. CoP is H/4 aft. Mz at ρ=1.225, v=100, α=90° is −4,593,750 N·m.
+    /// Vacuum and zero α leave the previous burns unchanged. A 5° disturbance restores.
+    /// </summary>
+    private static bool VerifyAero(SimulationReport earth, SimulationReport vacuum)
+    {
+        bool geometry = AeroMoment.CopAxialOffsetM == CylinderInertia.HeightM * 0.25d
+            && AeroMoment.CopAxialOffsetM == 12.5d
+            && AeroMoment.ReferenceAreaM2 == 60d;
+        Vector3d sideways = new Vector3d(100d, 0d, 0d);
+        double force = AeroMoment.NormalForceN(1.225d, 100d, 1d);
+        Vector3d moment = AeroMoment.Moment(QuaternionD.Identity, sideways, 1.225d);
+        bool reference = moment.X == 0d
+            && moment.Y == 0d
+            && moment.Z == -AeroMoment.CopAxialOffsetM * force
+            && moment.Z == -4593750d
+            && AeroMoment.Moment(QuaternionD.Identity, sideways, 0d).SqrMagnitude == 0d
+            && AeroMoment.Moment(QuaternionD.Identity, new Vector3d(0d, 100d, 0d), 1.225d).SqrMagnitude == 0d
+            && AeroMoment.SinAngleOfAttack(new Vector3d(0d, -40d, 0d)) == 0d;
+        bool quiet = earth.Samples[18].AeroMomentZ == 0d
+            && earth.Samples[18].AngleOfAttackRad == 0d
+            && earth.Samples[18].QuaternionW == 1d
+            && Math.Abs(earth.AchievedDeltaVMps - 296.123035d) < 1e-4d
+            && vacuum.Samples[18].AeroMomentZ == 0d
+            && vacuum.Samples[18].MomentZ == 0d
+            && vacuum.AchievedDeltaVMps == earth.ThrustIntegratedDeltaVMps;
+
+        PlanetaryEnvironment env = PlanetaryEnvironment.CreateEarth();
+        env.GravityEnabled = false;
+        env.AtmosphereEnabled = true;
+        IntegratorRK4 integrator = new IntegratorRK4(env, PropulsionModel.CreateDefaultStage());
+        VehicleState state = VehicleState.CreateSeaLevel(env);
+        state.Velocity = new Vector3d(0d, 100d, 0d);
+        double alpha0 = 5d * Math.PI / 180d;
+        QuaternionD pitched = QuaternionD.FromAxisAngle(new Vector3d(0d, 0d, 1d), alpha0);
+        state.Attitude = pitched;
+        state.InitialAttitude = pitched;
+        double alphaStart = AeroMoment.AngleOfAttackRad(AeroMoment.VelocityBody(state.Attitude, state.Velocity));
+        Vector3d m0 = AeroMoment.Moment(state.Attitude, state.Velocity, env.AtmosphericDensityKgM3(state.Position));
+        bool restoringStart = Math.Abs(alphaStart - alpha0) < 1e-12d && m0.Z < 0d;
+
+        double maxAbs = 0d;
+        bool crossed = false;
+        bool early = false;
+        bool finite = true;
+        int steps = 120 * IntegratorRK4.StepHz;
+        for (int n = 1; n <= steps; n++)
+        {
+            integrator.Step(state, 1d / IntegratorRK4.StepHz, 1, 0d);
+            double alpha = AeroMoment.AngleOfAttackRad(AeroMoment.VelocityBody(state.Attitude, state.Velocity));
+            if (double.IsNaN(alpha) || double.IsNaN(state.AngularVelocityBody.Z) || double.IsNaN(state.Attitude.W)) finite = false;
+            double abs = Math.Abs(alpha);
+            if (abs > maxAbs) maxAbs = abs;
+            if (alpha < 0d) crossed = true;
+            if (n == 5 * IntegratorRK4.StepHz)
+            {
+                early = state.AngularVelocityBody.Z < 0d && alpha < alpha0;
+            }
+        }
+        bool oscillates = restoringStart && early && crossed && finite && maxAbs < 0.35d;
+        bool ok = geometry && reference && quiet && oscillates;
+        if (!ok)
+        {
+            Console.WriteLine("AERO FAIL geometry=" + geometry + " reference=" + reference + " quiet=" + quiet + " oscillates=" + oscillates + " max=" + maxAbs.ToString("G6") + " mz=" + moment.Z.ToString("G17"));
+        }
+        return ok;
+    }
+
+    /// <summary>
+    /// Pitch PD. δ = −(Kp θ + Kd ωz), clamped to ±5°.
+    /// Zero error leaves the atmospheric burn unchanged. Off forces δ = 0.
+    /// A 5° vacuum disturbance saturates, then settles inside 10 s.
+    /// </summary>
+    private static bool VerifyAttitudeHold(SimulationReport earth)
+    {
+        SimulationReport held = SimulationHarness.RunVerticalBurn(false, 1, Vector3d.Zero, 0d, true, QuaternionD.Identity);
+        SimulationReport disabled = SimulationHarness.RunVerticalBurn(false, 1, Vector3d.Zero, 0d, false, QuaternionD.Identity);
+        TelemetrySample end = held.Samples[18];
+        bool baseline = held.AchievedDeltaVMps == earth.AchievedDeltaVMps
+            && end.AltitudeM == earth.Samples[18].AltitudeM
+            && end.SpeedMps == earth.Samples[18].SpeedMps
+            && end.PropellantKg == earth.Samples[18].PropellantKg
+            && Math.Abs(held.AchievedDeltaVMps - 296.123d) < 0.001d
+            && Math.Abs(end.AltitudeM - 10800.316d) < 0.01d
+            && end.GimbalRad == 0d
+            && end.MomentZ == 0d
+            && Math.Abs(end.QuaternionW - 1d) < 1e-9d
+            && Math.Abs(end.QuaternionX) < 1e-9d
+            && Math.Abs(end.QuaternionY) < 1e-9d
+            && Math.Abs(end.QuaternionZ) < 1e-9d
+            && end.OmegaBodyX == 0d
+            && end.OmegaBodyY == 0d
+            && end.OmegaBodyZ == 0d
+            && disabled.AchievedDeltaVMps == earth.AchievedDeltaVMps
+            && disabled.Samples[18].AltitudeM == earth.Samples[18].AltitudeM
+            && disabled.Samples[18].GimbalRad == 0d;
+
+        QuaternionD pitched = QuaternionD.FromAxisAngle(new Vector3d(0d, 0d, 1d), AttitudeController.GimbalLimitRad);
+        PlanetaryEnvironment env = PlanetaryEnvironment.CreateEarth(false);
+        env.GravityEnabled = false;
+        env.AtmosphereEnabled = false;
+        VehicleState openLoop = VehicleState.CreateSeaLevel(env);
+        openLoop.ControllerEnabled = false;
+        openLoop.Attitude = pitched;
+        bool forced = AttitudeController.EffectiveGimbal(openLoop) == 0d
+            && AttitudeController.Kp == 1d
+            && AttitudeController.Kd == 1.5d;
+
+        IntegratorRK4 integrator = new IntegratorRK4(env, PropulsionModel.CreateDefaultStage());
+        VehicleState state = VehicleState.CreateSeaLevel(env);
+        state.ControllerEnabled = true;
+        state.Attitude = pitched;
+        state.InitialAttitude = pitched;
+        double command = AttitudeController.Command(state.Attitude, 0d);
+        bool saturated = command == -AttitudeController.GimbalLimitRad
+            && Math.Abs(AttitudeController.PitchAngleRad(state.Attitude) - AttitudeController.GimbalLimitRad) < 1e-15d
+            && state.TotalMassKg == 1320000d;
+
+        bool crossed = false;
+        double overshoot = 0d;
+        double theta5 = 1d;
+        double wz5 = 1d;
+        double theta10 = 1d;
+        double wz10 = 1d;
+        bool finite = true;
+        int steps = 10 * IntegratorRK4.StepHz;
+        for (int n = 0; n <= steps; n++)
+        {
+            double theta = AttitudeController.PitchAngleRad(state.Attitude);
+            double wz = state.AngularVelocityBody.Z;
+            if (n > 0 && theta <= 0d) crossed = true;
+            if (crossed && -theta > overshoot) overshoot = -theta;
+            if (n == 5 * IntegratorRK4.StepHz)
+            {
+                theta5 = theta;
+                wz5 = wz;
+            }
+            if (n == 10 * IntegratorRK4.StepHz)
+            {
+                theta10 = theta;
+                wz10 = wz;
+            }
+            if (n == steps) break;
+            integrator.Step(state, 1d / IntegratorRK4.StepHz, 1, 1d);
+            if (double.IsNaN(state.Attitude.W) || Math.Abs(AttitudeController.EffectiveGimbal(state)) > AttitudeController.GimbalLimitRad + 1e-15d)
+            {
+                finite = false;
+            }
+        }
+        double deg = Math.PI / 180d;
+        bool settled = finite
+            && crossed
+            && Math.Abs(theta5) < 0.10d * deg
+            && Math.Abs(wz5) < 0.010d
+            && Math.Abs(theta10) < 0.05d * deg
+            && Math.Abs(wz10) < 0.005d
+            && overshoot < 0.20d * deg;
+        bool ok = baseline && forced && saturated && settled;
+        if (!ok)
+        {
+            Console.WriteLine("HOLD FAIL baseline=" + baseline + " forced=" + forced + " saturated=" + saturated + " settled=" + settled
+                + " th5=" + theta5.ToString("G6") + " wz5=" + wz5.ToString("G6")
+                + " th10=" + theta10.ToString("G6") + " wz10=" + wz10.ToString("G6")
+                + " over=" + overshoot.ToString("G6"));
         }
         return ok;
     }

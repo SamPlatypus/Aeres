@@ -1,0 +1,32 @@
+Continue from the verified aerodynamic moment pass. Add the rate-damping and attitude-error feedback controller (PD loop) that commands gimbal deflection to null body rates and hold target attitude.
+
+1. Control Law & Coordinates:
+- Longitudinal axis is body +Y; pitch rotates about body Z with gimbal deflection δ.
+- Attitude error about Z:
+  * Canonicalize quaternion: if q.W < 0, negate all components (q = -q).
+  * Pitch angle: θ = 2 · atan2(q.Z, q.W).
+  * Error: θ_err = θ − θ_target (where θ_target = 0 for vertical hold).
+- Feedback equation: δ_cmd = −(Kp · θ_err + Kd · ω_z)
+- Gains: Kp = 1.0 (rad/rad); Kd = 1.5 s.
+- Saturation: Clamped strictly to ±5.0° (±0.0872665 rad).
+- Torque applied: M_z = d · T · sin(δ), with nozzle arm d = 25.0 m aft of center of mass. (Positive θ_err commands negative δ, yielding negative restoring moment M_z).
+- Include a ControllerEnabled boolean toggle (default true).
+
+2. Verification & Regression Criteria (update unity/Verify/Program.cs):
+- Test A (Atmospheric Baseline Regression):
+  * Run the standard 90 s Earth launch burn in atmosphere (vacuum = false).
+  * With ControllerEnabled = true and zero disturbance (θ_err = 0, ω = 0), commanded δ = 0.0° and M_z = 0 N·m.
+  * Baseline matches sealed numbers: Δv within 0.001 m/s of 296.123 m/s, altitude within 0.01 m of 10,800.316 m, quaternion identity (|q.W − 1| < 1e-9, |q.X| < 1e-9, |q.Y| < 1e-9, |q.Z| < 1e-9), and ω = 0.
+  * Disabled Toggle Check: Setting ControllerEnabled = false forces δ = 0.0° unconditionally, bit-for-bit recovering prior passes.
+
+- Test B (Vacuum 10 s Disturbance Recovery & Settling):
+  * Run a 10.0 s burn in vacuum (vacuum = true, atmosphere disabled) at initial launch mass (1,320,000 kg) under nominal thrust (15 MN).
+  * Initial conditions: +5.0° pitch error (q = QuaternionD.FromAxisAngle(Vector3d.UnitZ, Math.PI * 5.0 / 180.0)) and ω = 0.
+  * At t = 0+, commanded δ immediately clamps to −5.0° (−0.0872665 rad).
+  * Negative angular rate ω_z develops, damping as θ approaches zero.
+  * Sample Assertions:
+    - At t = 5.0 s: assert |θ_err| < 0.10° (0.00175 rad) and |ω_z| < 0.010 rad/s.
+    - At t = 10.0 s: assert |θ_err| < 0.05° (0.00087 rad) and |ω_z| < 0.005 rad/s.
+    - Peak overshoot after first zero crossing remains < 0.20°.
+
+Extend only. Complete C# 9 drop-in code. No placeholders. Keep existing physics and verifier passes intact.

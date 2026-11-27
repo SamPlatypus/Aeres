@@ -16,16 +16,25 @@ export interface VehicleState {
   initialAttitude: QuaternionD;
   /** Body-frame angular velocity, rad/s. Torque-free Euler when non-zero and the gimbal is zero. */
   angularVelocityBody: Vector3d;
-  /** Constant deflection of thrust from body +Y toward +X, radians. Zero keeps Pass 10. */
+  /** Constant deflection of thrust from body +Y toward +X, radians. Zero keeps Pass 10. Ignored while the attitude controller is on. */
   gimbalRad: number;
+  /** Pitch PD commands the gimbal. Off leaves gimbalRad as the open-loop deflection. */
+  controllerEnabled: boolean;
+  /** Inertial pitch the PD holds. Zero is body +Y along inertial +Y. */
+  pitchTargetRad: number;
+  /** Flip only. Rotational torque is the gimbal moment; aerodynamic moment stays on every other path. */
+  flipHold: boolean;
 }
 
-function kinematicRest(angularVelocityBody: Vector3d = Vector3d.zero, gimbalRad = 0) {
+function kinematicRest(angularVelocityBody: Vector3d = Vector3d.zero, gimbalRad = 0, controllerEnabled = true) {
   return {
     attitude: QuaternionD.identity,
     initialAttitude: QuaternionD.identity,
     angularVelocityBody,
     gimbalRad,
+    controllerEnabled,
+    pitchTargetRad: 0,
+    flipHold: false,
   };
 }
 
@@ -33,6 +42,7 @@ export function createSeaLevelState(
   env: PlanetaryEnvironment,
   angularVelocityBody: Vector3d = Vector3d.zero,
   gimbalRad = 0,
+  controllerEnabled = true,
 ): VehicleState {
   return {
     position: new Vector3d(0, env.equatorialRadiusM, 0),
@@ -40,7 +50,7 @@ export function createSeaLevelState(
     totalMassKg: DRY_MASS_KG + INITIAL_PROPELLANT_KG,
     propellantMassKg: INITIAL_PROPELLANT_KG,
     thrustIntegratedDeltaVMps: 0,
-    ...kinematicRest(angularVelocityBody, gimbalRad),
+    ...kinematicRest(angularVelocityBody, gimbalRad, controllerEnabled),
   };
 }
 
@@ -87,6 +97,7 @@ export function createEntryState(
   entry: EntryInterface = MARS_ENTRY_INTERFACE,
   angularVelocityBody: Vector3d = Vector3d.zero,
   gimbalRad = 0,
+  controllerEnabled = true,
 ): VehicleState {
   const radius = env.equatorialRadiusM + entry.altitudeM;
   const gamma = (entry.flightPathDeg * Math.PI) / 180;
@@ -96,7 +107,7 @@ export function createEntryState(
     totalMassKg: DRY_MASS_KG + entry.propellantKg,
     propellantMassKg: entry.propellantKg,
     thrustIntegratedDeltaVMps: 0,
-    ...kinematicRest(angularVelocityBody, gimbalRad),
+    ...kinematicRest(angularVelocityBody, gimbalRad, controllerEnabled),
   };
 }
 
@@ -111,6 +122,9 @@ export function cloneState(state: VehicleState): VehicleState {
     initialAttitude: state.initialAttitude,
     angularVelocityBody: state.angularVelocityBody,
     gimbalRad: state.gimbalRad,
+    controllerEnabled: state.controllerEnabled,
+    pitchTargetRad: state.pitchTargetRad,
+    flipHold: state.flipHold,
   };
 }
 
@@ -133,5 +147,8 @@ export function withTranslation(
     initialAttitude: state.initialAttitude,
     angularVelocityBody: state.angularVelocityBody,
     gimbalRad: state.gimbalRad,
+    controllerEnabled: state.controllerEnabled,
+    pitchTargetRad: state.pitchTargetRad,
+    flipHold: state.flipHold,
   };
 }

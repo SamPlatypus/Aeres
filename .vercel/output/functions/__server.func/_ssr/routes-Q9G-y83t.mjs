@@ -3,7 +3,7 @@ import { K as require_react, b as require_jsx_runtime } from "../_libs/@tanstack
 import { i as Copy, n as RotateCcw, r as Download } from "../_libs/lucide-react.mjs";
 import { t as clsx } from "../_libs/clsx.mjs";
 import { a as CartesianGrid, c as Tooltip, i as Line, n as YAxis, o as ReferenceLine, r as XAxis, s as ResponsiveContainer, t as LineChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-Bc3ybXQT.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-Q9G-y83t.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 function compactTick(value) {
@@ -191,9 +191,65 @@ var MARS_ENTRY_SPEED_MPS = 6e3;
 var MARS_ENTRY_PROPELLANT_KG = 5e4;
 /** Open-loop terminal sequence. Used only when that mode is armed on a Mars entry. */
 var TERMINAL_TRIGGER_ALTITUDE_M = 3e3;
+var TERMINAL_FLIP_THROTTLE = .6;
 var TERMINAL_LANDING_THROTTLE = .6;
 var TERMINAL_EARLY_ALTITUDE_M = 5e3;
 var TERMINAL_MAX_TIME_S = 2400;
+/** seconds. Rate damping on body ωz. */
+var ATTITUDE_KD = 1.5;
+/** Nozzle stop. ±5°. */
+var GIMBAL_LIMIT_RAD = 5 * Math.PI / 180;
+/**
+* Pitch about body +Z. The quaternion is canonicalized so w ≥ 0, then
+* θ = 2 atan2(q.z, q.w). Identity is exactly 0.
+*/
+function pitchAngleRad(attitude) {
+	let z = attitude.z;
+	let w = attitude.w;
+	if (w < 0) {
+		z = -z;
+		w = -w;
+	}
+	return 2 * Math.atan2(z, w);
+}
+/** θ − θ_target. Target defaults to inertial +Y. */
+function pitchErrorRad(attitude, targetRad = 0) {
+	return pitchAngleRad(attitude) - targetRad;
+}
+/**
+* Signed angle of local up about +Z, in the same convention as pitchAngleRad.
+* On the +Y axis this is exactly 0.
+*/
+function verticalTargetRad(position) {
+	const radius = Math.hypot(position.x, position.y, position.z);
+	if (!(radius > 0)) return 0;
+	return Math.atan2(-position.x / radius, position.y / radius);
+}
+/** Signed pitch of body +Y relative to local vertical. */
+function verticalPitchErrorRad(attitude, position) {
+	return pitchErrorRad(attitude, verticalTargetRad(position));
+}
+/**
+* δ = −(Kp θ_err + Kd ωz), clamped to ±5°.
+* A positive pitch error commands a negative gimbal.
+* A zero error and zero rate return exactly 0, not −0.
+*/
+function gimbalCommandRad(attitude, omegaZ, targetRad = 0) {
+	const delta = -(1 * pitchErrorRad(attitude, targetRad) + ATTITUDE_KD * omegaZ);
+	if (delta > GIMBAL_LIMIT_RAD) return GIMBAL_LIMIT_RAD;
+	if (delta < -GIMBAL_LIMIT_RAD) return -GIMBAL_LIMIT_RAD;
+	if (delta === 0) return 0;
+	return delta;
+}
+/**
+* Deflection the nozzle actually holds.
+* Controller off returns the open-loop gimbal, which is the prior-pass command.
+* Controller on replaces that command with the PD law.
+*/
+function effectiveGimbalRad(state) {
+	if (!state.controllerEnabled) return state.gimbalRad;
+	return gimbalCommandRad(state.attitude, state.angularVelocityBody.z, state.pitchTargetRad);
+}
 /** Immutable double-precision 3-vector. IEEE-754 binary64, no single-precision path. */
 var Vector3d = class Vector3d {
 	static zero = new Vector3d(0, 0, 0);
@@ -459,6 +515,58 @@ function integrateEulerSubsteps(attitude, omega, massKg, dt, substeps) {
 		omega: w
 	};
 }
+/**
+* Center of pressure, aft of the geometric center on body −Y.
+* H/4 = 12.5 m. A lateral force here restores a positive angle of attack.
+*/
+var COP_AXIAL_OFFSET_M = 50 / 4;
+/** Same reference area as the axial drag model. */
+var AERO_REFERENCE_AREA_M2 = 60;
+/** Inertial velocity expressed in the body frame. v_b = q* ⊗ v_i ⊗ q. */
+function velocityBody(attitude, velocityInertial) {
+	return attitude.conjugate.rotate(velocityInertial);
+}
+/**
+* Signed angle of attack in the body XY plane.
+* α = atan2(v_x, v_y). Zero in-plane velocity is exactly 0.
+*/
+function angleOfAttackRad(velocityBodyFrame) {
+	if (velocityBodyFrame.x === 0 && velocityBodyFrame.y === 0) return 0;
+	return Math.atan2(velocityBodyFrame.x, velocityBodyFrame.y);
+}
+/**
+* sin α from the body-frame components. v_x = 0 is exactly 0, including when
+* the nose is anti-parallel to the velocity (atan2 would return π and sin(π) is not a clean 0).
+*/
+function sinAngleOfAttack(velocityBodyFrame) {
+	if (velocityBodyFrame.x === 0) return 0;
+	const lateral = Math.hypot(velocityBodyFrame.x, velocityBodyFrame.y);
+	if (!(lateral > 0)) return 0;
+	return velocityBodyFrame.x / lateral;
+}
+/** Lateral aerodynamic force along body +X. Signed with sin α. */
+function normalForceN(densityKgM3, speedMps, sinAlpha) {
+	if (!(densityKgM3 > 0) || !(speedMps > 0) || sinAlpha === 0) return 0;
+	const v2 = speedMps * speedMps;
+	return .5 * densityKgM3 * v2 * AERO_REFERENCE_AREA_M2 * sinAlpha;
+}
+/**
+* Aerodynamic moment about the CoM.
+* F = (F_normal, 0, 0), r_cop = (0, −H/4, 0).
+* M_z = r_cop.y · F_x = −(H/4) · ½ ρ |v|² S sin α.
+* That sign is restoring for dq/dt = ½ q ⊗ ω: a positive α produces M_z < 0.
+* Vacuum, zero speed, and zero α return the shared zero vector.
+*/
+function aerodynamicMoment(attitude, velocityInertial, densityKgM3) {
+	if (!(densityKgM3 > 0)) return Vector3d.zero;
+	const speed = velocityInertial.magnitude;
+	if (!(speed > 0)) return Vector3d.zero;
+	const sinAlpha = sinAngleOfAttack(velocityBody(attitude, velocityInertial));
+	if (sinAlpha === 0) return Vector3d.zero;
+	const mz = -COP_AXIAL_OFFSET_M * normalForceN(densityKgM3, speed, sinAlpha);
+	if (mz === 0) return Vector3d.zero;
+	return new Vector3d(0, 0, mz);
+}
 /** Verification cutoff. 60 s of thrust, then ballistic coast. */
 var CUTOFF_AT_60_S = {
 	tCutoffS: 60,
@@ -622,22 +730,25 @@ function idealRocketDeltaVMps(model, initialMassKg, finalMassKg) {
 	if (!(initialMassKg > 0) || !(finalMassKg > 0) || finalMassKg > initialMassKg) throw new Error("Rocket equation requires 0 < mf ≤ m0.");
 	return exhaustVelocityMps(model) * Math.log(initialMassKg / finalMassKg);
 }
-function kinematicRest(angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
+function kinematicRest(angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = true) {
 	return {
 		attitude: QuaternionD.identity,
 		initialAttitude: QuaternionD.identity,
 		angularVelocityBody,
-		gimbalRad
+		gimbalRad,
+		controllerEnabled,
+		pitchTargetRad: 0,
+		flipHold: false
 	};
 }
-function createSeaLevelState(env, angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
+function createSeaLevelState(env, angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = true) {
 	return {
 		position: new Vector3d(0, env.equatorialRadiusM, 0),
 		velocity: Vector3d.zero,
 		totalMassKg: DRY_MASS_KG + INITIAL_PROPELLANT_KG,
 		propellantMassKg: INITIAL_PROPELLANT_KG,
 		thrustIntegratedDeltaVMps: 0,
-		...kinematicRest(angularVelocityBody, gimbalRad)
+		...kinematicRest(angularVelocityBody, gimbalRad, controllerEnabled)
 	};
 }
 /** 125 km, 6000 m/s, −12°. Engines are not part of the state. */
@@ -663,7 +774,7 @@ function marsEntryOrDefault(speedMps, propellantKg, flightPathDeg) {
 * Flight-path angle is from the local horizontal, negative downward.
 * Attitude starts at identity unless a body rate is supplied; the quaternion stays identity.
 */
-function createEntryState(env, entry = MARS_ENTRY_INTERFACE, angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
+function createEntryState(env, entry = MARS_ENTRY_INTERFACE, angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = true) {
 	const radius = env.equatorialRadiusM + entry.altitudeM;
 	const gamma = entry.flightPathDeg * Math.PI / 180;
 	return {
@@ -672,7 +783,7 @@ function createEntryState(env, entry = MARS_ENTRY_INTERFACE, angularVelocityBody
 		totalMassKg: DRY_MASS_KG + entry.propellantKg,
 		propellantMassKg: entry.propellantKg,
 		thrustIntegratedDeltaVMps: 0,
-		...kinematicRest(angularVelocityBody, gimbalRad)
+		...kinematicRest(angularVelocityBody, gimbalRad, controllerEnabled)
 	};
 }
 function cloneState(state) {
@@ -685,7 +796,10 @@ function cloneState(state) {
 		attitude: state.attitude,
 		initialAttitude: state.initialAttitude,
 		angularVelocityBody: state.angularVelocityBody,
-		gimbalRad: state.gimbalRad
+		gimbalRad: state.gimbalRad,
+		controllerEnabled: state.controllerEnabled,
+		pitchTargetRad: state.pitchTargetRad,
+		flipHold: state.flipHold
 	};
 }
 /** Keep attitude and the constant body rate while replacing the translational state. */
@@ -699,7 +813,10 @@ function withTranslation(state, position, velocity, propellantMassKg, totalMassK
 		attitude: state.attitude,
 		initialAttitude: state.initialAttitude,
 		angularVelocityBody: state.angularVelocityBody,
-		gimbalRad: state.gimbalRad
+		gimbalRad: state.gimbalRad,
+		controllerEnabled: state.controllerEnabled,
+		pitchTargetRad: state.pitchTargetRad,
+		flipHold: state.flipHold
 	};
 }
 function massFromPropellant(propellantKg) {
@@ -762,7 +879,10 @@ function advance(state, deriv, h) {
 		attitude: state.attitude,
 		initialAttitude: state.initialAttitude,
 		angularVelocityBody: state.angularVelocityBody,
-		gimbalRad: state.gimbalRad
+		gimbalRad: state.gimbalRad,
+		controllerEnabled: state.controllerEnabled,
+		pitchTargetRad: state.pitchTargetRad,
+		flipHold: state.flipHold
 	};
 }
 function sumDeriv(a, b) {
@@ -782,7 +902,8 @@ function scaleDeriv(d, s) {
 	};
 }
 function rk4(state, dt, env, propulsion, throttle, thrustDirection) {
-	if (state.gimbalRad !== 0 && throttle > 0) thrustDirection = state.attitude.rotate(bodyThrustDirection(state.gimbalRad));
+	const gimbal = effectiveGimbalRad(state);
+	if (gimbal !== 0 && throttle > 0) thrustDirection = state.attitude.rotate(bodyThrustDirection(gimbal));
 	const k1 = derivative(state, env, propulsion, throttle, thrustDirection);
 	const k2 = derivative(advance(state, k1, dt * .5), env, propulsion, throttle, thrustDirection);
 	const k3 = derivative(advance(state, k2, dt * .5), env, propulsion, throttle, thrustDirection);
@@ -792,15 +913,27 @@ function rk4(state, dt, env, propulsion, throttle, thrustDirection) {
 		next.propellantMassKg = 0;
 		next.totalMassKg = DRY_MASS_KG;
 	} else next.totalMassKg = massFromPropellant(next.propellantMassKg);
-	if (state.gimbalRad !== 0) {
-		const moment = gimbalMoment(thrustMagnitudeN(propulsion, throttle, next.propellantMassKg), state.gimbalRad);
-		if (moment.x !== 0 || moment.y !== 0 || moment.z !== 0 || !QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
-			const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt, moment);
+	const aero = state.flipHold ? Vector3d.zero : aerodynamicMoment(state.attitude, state.velocity, atmosphericDensityKgM3(env, state.position));
+	if (!(aero.x !== 0 || aero.y !== 0 || aero.z !== 0)) {
+		if (gimbal !== 0) {
+			const moment = gimbalMoment(thrustMagnitudeN(propulsion, throttle, next.propellantMassKg), gimbal);
+			if (moment.x !== 0 || moment.y !== 0 || moment.z !== 0 || !QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
+				const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt, moment);
+				next.attitude = rotation.attitude;
+				next.angularVelocityBody = rotation.omega;
+			}
+		} else if (!QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
+			const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt);
 			next.attitude = rotation.attitude;
 			next.angularVelocityBody = rotation.omega;
 		}
-	} else if (!QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
-		const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt);
+	} else {
+		let moment = aero;
+		if (gimbal !== 0) {
+			const thrustMoment = gimbalMoment(thrustMagnitudeN(propulsion, throttle, next.propellantMassKg), gimbal);
+			moment = new Vector3d(thrustMoment.x + aero.x, thrustMoment.y + aero.y, thrustMoment.z + aero.z);
+		}
+		const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt, moment);
 		next.attitude = rotation.attitude;
 		next.angularVelocityBody = rotation.omega;
 	}
@@ -830,10 +963,12 @@ function stepOne(state, dt, env, propulsion, throttle, thrustDirection) {
 /**
 * Advance the vehicle by `dt` seconds using `substeps` equal RK4 sub-steps.
 * Attitude and body rate advance on the same sub-steps.
-* A zero gimbal leaves the thrust line on the body axis, so the moment is zero and this
+* A zero gimbal and a zero aerodynamic moment leave the thrust line on the body axis, so this
 * step is the Pass 10 integrator. A non-zero gimbal holds the thrust vector off +Y in the
 * body frame, points the translational thrust along it, and applies M = r × F.
-* Identically zero ω and zero gimbal leave the quaternion untouched.
+* Aerodynamic moment is added only when density and angle of attack are both non-zero.
+* It does not enter the translational force sum. Identically zero ω, zero gimbal, and zero
+* aero moment leave the quaternion untouched.
 * Mutates nothing: returns the next state.
 */
 function stepRk4(state, dt, substeps, env, propulsion, throttle, thrustDirection) {
@@ -962,7 +1097,7 @@ var DEFAULT_TERMINAL_SEQUENCE = {
 	triggerAltitudeM: TERMINAL_TRIGGER_ALTITUDE_M,
 	triggerTimeS: null,
 	flipDurationS: 8,
-	flipThrottle: 0,
+	flipThrottle: TERMINAL_FLIP_THROTTLE,
 	landingThrottle: TERMINAL_LANDING_THROTTLE,
 	manualCutoffS: null
 };
@@ -971,7 +1106,7 @@ var EARLY_TERMINAL_SEQUENCE = {
 	triggerAltitudeM: TERMINAL_EARLY_ALTITUDE_M,
 	triggerTimeS: null,
 	flipDurationS: 8,
-	flipThrottle: 0,
+	flipThrottle: TERMINAL_FLIP_THROTTLE,
 	landingThrottle: 1,
 	manualCutoffS: null
 };
@@ -994,23 +1129,6 @@ function localUp(position) {
 	const radius = position.magnitude;
 	if (!(radius > 0)) return Vector3d.up;
 	return position.scale(1 / radius);
-}
-/** Unit slerp. Antiparallel vectors rotate through a perpendicular so the flip stays defined. */
-function slerpUnit(from, to, u) {
-	const a = from.normalized;
-	const b = to.normalized;
-	const clamped = Math.max(0, Math.min(1, u));
-	if (!(a.magnitude > 0)) return b.magnitude > 0 ? b : Vector3d.up;
-	if (!(b.magnitude > 0)) return a;
-	const dot = Math.max(-1, Math.min(1, a.dot(b)));
-	if (dot > .999999) return b;
-	if (dot < -.999999) {
-		const side = Math.abs(a.y) < .9 ? a.cross(Vector3d.up).normalized : a.cross(new Vector3d(1, 0, 0)).normalized;
-		return clamped < .5 ? slerpUnit(a, side, clamped * 2) : slerpUnit(side, b, clamped * 2 - 1);
-	}
-	const omega = Math.acos(dot);
-	const scale = Math.sin(omega);
-	return a.scale(Math.sin((1 - clamped) * omega) / scale).add(b.scale(Math.sin(clamped * omega) / scale)).normalized;
 }
 /**
 * Landing direction. fraction <= 0 returns `up` unchanged so Pass 6 stays the same vector.
@@ -1052,54 +1170,55 @@ function proportionalHorizontalFraction(config, position, velocity) {
 	return fraction;
 }
 /**
-* Point-mass terminal sequence. Thrust direction slews from the trigger's
-* anti-velocity vector to local up, then stays on local up unless a horizontal
-* landing fraction is set. No attitude state.
+* Powered flip onto local vertical, then the landing burn.
+* The flip torque is the PD gimbal moment. Landing aim is unchanged.
 */
 var TerminalSequence = class {
 	config;
 	triggerAtS = null;
-	retrograde = null;
+	aligned = false;
 	constructor(config) {
 		this.config = config;
 	}
 	get triggerTimeS() {
 		return this.triggerAtS;
 	}
-	command(timeS, position, velocity, propellantKg, altitudeM) {
+	command(timeS, position, velocity, propellantKg, altitudeM, attitude = QuaternionD.identity, omegaZ = 0) {
 		const up = localUp(position);
 		if (this.triggerAtS === null) {
 			const byTime = this.config.triggerTimeS !== null && timeS >= this.config.triggerTimeS;
 			const byAltitude = this.config.triggerAltitudeM !== null && altitudeM > 0 && altitudeM <= this.config.triggerAltitudeM;
-			if (byTime || byAltitude) {
-				this.triggerAtS = timeS;
-				this.retrograde = velocity.magnitude > 0 ? velocity.normalized.scale(-1) : up;
-			}
+			if (byTime || byAltitude) this.triggerAtS = timeS;
 		}
-		if (this.triggerAtS === null || this.retrograde === null) return {
+		if (this.triggerAtS === null) return {
 			phase: "Coast",
 			throttle: 0,
 			direction: up,
 			pitchFromVerticalDeg: 0
 		};
-		const elapsed = timeS - this.triggerAtS;
-		const cutoff = this.config.manualCutoffS !== null && timeS >= this.config.manualCutoffS;
-		if (elapsed < this.config.flipDurationS && !cutoff) {
-			const blend = this.config.flipDurationS > 0 ? elapsed / this.config.flipDurationS : 1;
-			const direction = slerpUnit(this.retrograde, up, blend);
-			return {
-				phase: "Flip",
-				throttle: this.config.flipThrottle,
-				direction,
-				pitchFromVerticalDeg: pitchFromVerticalDeg(direction, position)
-			};
-		}
-		if (cutoff || propellantKg <= 0) return {
+		if (this.config.manualCutoffS !== null && timeS >= this.config.manualCutoffS || propellantKg <= 0) return {
 			phase: "Complete",
 			throttle: 0,
 			direction: up,
 			pitchFromVerticalDeg: 0
 		};
+		const armed = this.config.flipControllerEnabled !== false;
+		if (!this.aligned && armed && timeS > this.triggerAtS) {
+			const error = verticalPitchErrorRad(attitude, position);
+			if (Math.abs(error) <= GIMBAL_LIMIT_RAD) this.aligned = true;
+		}
+		if (!this.aligned) {
+			const target = verticalTargetRad(position);
+			const delta = armed ? gimbalCommandRad(attitude, omegaZ, target) : 0;
+			const direction = attitude.rotate(bodyThrustDirection(delta));
+			return {
+				phase: "Flip",
+				throttle: this.config.flipThrottle,
+				direction,
+				pitchFromVerticalDeg: pitchFromVerticalDeg(direction, position),
+				bodyThrust: true
+			};
+		}
 		if (this.config.guidanceMode === "Proportional") {
 			const fraction = proportionalHorizontalFraction(this.config, position, velocity);
 			const aim = landingThrustDirection(up, velocity, fraction > 1 ? 1 : fraction);
@@ -1177,6 +1296,9 @@ function surfaceState(before, after, radiusM) {
 			initialAttitude: before.initialAttitude,
 			angularVelocityBody: new Vector3d(mix(before.angularVelocityBody.x, after.angularVelocityBody.x), mix(before.angularVelocityBody.y, after.angularVelocityBody.y), mix(before.angularVelocityBody.z, after.angularVelocityBody.z)),
 			gimbalRad: before.gimbalRad,
+			controllerEnabled: before.controllerEnabled,
+			pitchTargetRad: before.pitchTargetRad,
+			flipHold: before.flipHold,
 			attitude: before.attitude.x === after.attitude.x && before.attitude.y === after.attitude.y && before.attitude.z === after.attitude.z && before.attitude.w === after.attitude.w ? before.attitude : slerpAttitude(before.attitude, after.attitude, u)
 		}
 	};
@@ -1256,6 +1378,10 @@ function frameFromForce(timeS, velocity, position, propellantKg, force, thrustPi
 		alphaX: 0,
 		alphaY: 0,
 		alphaZ: 0,
+		angleOfAttackRad: 0,
+		aeroMomentZ: 0,
+		pitchAngleRad: 0,
+		controllerEnabled: false,
 		rotationAngleRad: 0
 	};
 }
@@ -1278,15 +1404,22 @@ function stampAttitude(frame, state) {
 	frame.inertiaIyy = inertia.iyy;
 	frame.inertiaIzz = inertia.izz;
 	frame.rotationAngleRad = QuaternionD.rotationAngleBetween(state.initialAttitude, state.attitude);
-	const moment = gimbalMoment(frame.thrustN, state.gimbalRad);
+	const aero = aerodynamicMoment(state.attitude, state.velocity, frame.densityKgM3);
+	const gimbal = effectiveGimbalRad(state);
+	const gimbalTorque = gimbalMoment(frame.thrustN, gimbal);
+	const moment = aero.x === 0 && aero.y === 0 && aero.z === 0 ? gimbalTorque : new Vector3d(gimbalTorque.x + aero.x, gimbalTorque.y + aero.y, gimbalTorque.z + aero.z);
 	const alpha = eulerRate(state.angularVelocityBody, inertia, moment);
-	frame.gimbalRad = state.gimbalRad;
+	frame.gimbalRad = gimbal;
 	frame.momentX = moment.x;
 	frame.momentY = moment.y;
 	frame.momentZ = moment.z;
 	frame.alphaX = alpha.x;
 	frame.alphaY = alpha.y;
 	frame.alphaZ = alpha.z;
+	frame.angleOfAttackRad = angleOfAttackRad(velocityBody(state.attitude, state.velocity));
+	frame.aeroMomentZ = aero.z;
+	frame.pitchAngleRad = pitchErrorRad(state.attitude);
+	frame.controllerEnabled = state.controllerEnabled;
 	return frame;
 }
 function formatLogLine(frame) {
@@ -1338,16 +1471,21 @@ function formatLogLine(frame) {
 		`Mz=${frame.momentZ.toFixed(3)}`,
 		`ax=${frame.alphaX.toFixed(9)}`,
 		`ay=${frame.alphaY.toFixed(9)}`,
-		`az=${frame.alphaZ.toFixed(9)}`
+		`az=${frame.alphaZ.toFixed(9)}`,
+		`aoa=${frame.angleOfAttackRad.toFixed(9)} rad`,
+		`Maero=${frame.aeroMomentZ.toFixed(3)}`,
+		`ctrl=${frame.controllerEnabled ? 1 : 0}`,
+		`perr=${frame.pitchAngleRad.toFixed(9)} rad`
 	].join(" | ");
 }
 var FRAME_STRIDE = 10;
 var VACUUM_AGREEMENT_LIMIT = .001;
 function sampleState(state, timeS, env, propulsion, throttle, thrustPitchDeg = 0, thrustDirection = Vector3d.up, timeSinceCutoffS = 0, body = env.name, speedOfSoundMps = env.speedOfSoundMps) {
-	const steered = state.gimbalRad !== 0 && throttle > 0 ? state.attitude.rotate(bodyThrustDirection(state.gimbalRad)) : thrustDirection;
+	const delta = effectiveGimbalRad(state);
+	const steered = delta !== 0 && throttle > 0 ? state.attitude.rotate(bodyThrustDirection(delta)) : thrustDirection;
 	const force = evaluateForces(state.position, state.velocity, state.propellantMassKg, env, propulsion, throttle, steered);
 	const mu = env.gravityEnabled ? env.muM3S2 : 0;
-	const pitchDeg = state.gimbalRad !== 0 && throttle > 0 ? Math.atan2(steered.x, steered.y) * 180 / Math.PI : thrustPitchDeg;
+	const pitchDeg = delta !== 0 && throttle > 0 ? Math.atan2(steered.x, steered.y) * 180 / Math.PI : thrustPitchDeg;
 	return stampAttitude(frameFromForce(timeS, state.velocity, state.position, state.propellantMassKg, force, pitchDeg, throttle > 0 ? 1 : 0, timeSinceCutoffS, specificMechanicalEnergyM2S2(state.position, state.velocity, mu), "numerical", 0, 0, 0, body, speedOfSoundMps), state);
 }
 /**
@@ -1356,7 +1494,7 @@ function sampleState(state, timeS, env, propulsion, throttle, thrustPitchDeg = 0
 * Fixed step 0.02 s. Optional RK4 sub-stepping.
 * Set disableGravityAndAtmosphere to compare integrated Δv with the rocket equation.
 */
-function runVerticalBurn(disableGravityAndAtmosphere, substeps = 1, angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
+function runVerticalBurn(disableGravityAndAtmosphere, substeps = 1, angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = false, initialAttitude = null) {
 	if (!Number.isInteger(substeps) || substeps < 1) throw new Error("substeps must be a positive integer");
 	const env = createEarthEnvironment({
 		gravityEnabled: !disableGravityAndAtmosphere,
@@ -1364,7 +1502,12 @@ function runVerticalBurn(disableGravityAndAtmosphere, substeps = 1, angularVeloc
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
+	if (initialAttitude) state = {
+		...state,
+		attitude: initialAttitude,
+		initialAttitude
+	};
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const steps = 4500;
@@ -1426,11 +1569,87 @@ function runVerticalBurn(disableGravityAndAtmosphere, substeps = 1, angularVeloc
 	};
 }
 /**
+* Engines off. Gravity off so the inertial velocity stays on +Y and α is the body pitch.
+* Atmosphere on. Initial attitude is a +Z rotation of `alphaDeg`, so α starts at that angle.
+* The center of pressure is aft of the CoM, so M_z restores α toward 0.
+*/
+function runWeathercockCoast(substeps = 1, alphaDeg = 5, speedMps = 100) {
+	if (!Number.isInteger(substeps) || substeps < 1) throw new Error("substeps must be a positive integer");
+	const env = createEarthEnvironment({
+		gravityEnabled: false,
+		atmosphereEnabled: true,
+		includeJ2: false
+	});
+	const propulsion = createDefaultPropulsion();
+	const alphaRad = alphaDeg * Math.PI / 180;
+	const attitude = alphaRad === 0 ? QuaternionD.identity : QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), alphaRad);
+	let state = createSeaLevelState(env, Vector3d.zero, 0, false);
+	state = {
+		...state,
+		velocity: new Vector3d(0, speedMps, 0),
+		attitude,
+		initialAttitude: attitude
+	};
+	const initialVelocity = state.velocity;
+	const initialMassKg = state.totalMassKg;
+	const steps = 6e3;
+	const logEvery = 250;
+	const samples = [];
+	const frames = [];
+	const logLines = [];
+	logLines.push(`ARES CORE weathercock | mode=ATMOSPHERE | gravity=off | thrust=0 | alpha0=${alphaDeg} deg | v=${speedMps} m/s | dt=0.02 s`);
+	for (let n = 0; n <= steps; n++) {
+		const timeS = n / 50;
+		if (n % logEvery === 0 || n % FRAME_STRIDE === 0) {
+			const frame = sampleState(state, timeS, env, propulsion, 0, 0, Vector3d.up, timeS);
+			if (n % FRAME_STRIDE === 0) frames.push(frame);
+			if (n % logEvery === 0) {
+				samples.push(frame);
+				logLines.push(formatLogLine(frame));
+			}
+		}
+		if (n === steps) break;
+		state = stepRk4(state, 1 / 50, substeps, env, propulsion, 0);
+	}
+	const finalMassKg = state.totalMassKg;
+	const ideal = idealRocketDeltaVMps(propulsion, initialMassKg, finalMassKg);
+	const achieved = state.velocity.sub(initialVelocity).magnitude;
+	const thrustDv = state.thrustIntegratedDeltaVMps;
+	const difference = ideal - achieved;
+	const relativeError = ideal > 0 ? Math.abs(achieved - ideal) / ideal : 0;
+	logLines.push(`ideal_dv_m_s=${ideal.toFixed(6)}`);
+	logLines.push(`achieved_dv_m_s=${achieved.toFixed(6)}`);
+	logLines.push("verdict=AERO_MOMENT engines off");
+	return {
+		disableGravityAndAtmosphere: false,
+		substeps,
+		samples,
+		frames,
+		logLines,
+		logText: logLines.join("\n"),
+		initialMassKg,
+		finalMassKg,
+		initialVelocity,
+		finalPosition: state.position,
+		finalVelocity: state.velocity,
+		idealDeltaVMps: ideal,
+		achievedDeltaVMps: achieved,
+		thrustIntegratedDeltaVMps: thrustDv,
+		differenceMps: difference,
+		relativeError,
+		vacuumCheckApplies: false,
+		vacuumCheckPassed: true,
+		pitchProgram: null,
+		cutoff: null,
+		endTimeS: 120
+	};
+}
+/**
 * Same 90 s sea-level burn as Pass 1, with an open-loop thrust direction.
 * A program that never leaves +Y delegates to runVerticalBurn, so those numbers stay identical.
 */
-function runPitchedBurn(disableGravityAndAtmosphere, substeps = 1, program, angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
-	if (pitchAngleDeg(90, program) === 0) return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad);
+function runPitchedBurn(disableGravityAndAtmosphere, substeps = 1, program, angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = false) {
+	if (pitchAngleDeg(90, program) === 0) return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad, controllerEnabled);
 	if (!Number.isInteger(substeps) || substeps < 1) throw new Error("substeps must be a positive integer");
 	const env = createEarthEnvironment({
 		gravityEnabled: !disableGravityAndAtmosphere,
@@ -1438,7 +1657,7 @@ function runPitchedBurn(disableGravityAndAtmosphere, substeps = 1, program, angu
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const steps = 4500;
@@ -1552,13 +1771,13 @@ function stepCommanded(state, timeS, dt, substeps, env, propulsion, cutoff, dire
 * Pass 3. Same sea-level burn as Pass 1 / Pass 2, with optional cutoff and a longer coast.
 * Cutoff that cannot engage before endTime, on a 90 s run, delegates to the verified function.
 */
-function runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
+function runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = false) {
 	if (!Number.isInteger(substeps) || substeps < 1) throw new Error("substeps must be a positive integer");
 	const steps = Math.round(endTimeS * 50);
 	if (!(steps > 0) || Math.abs(endTimeS * 50 - steps) > 1e-6) throw new Error("end time must land on the 50 Hz step grid");
 	if (cutoff.propellantRemainingKg === null && (cutoff.tCutoffS === null || cutoff.tCutoffS > endTimeS) && endTimeS === 90) {
-		if (pitchAngleDeg(90, program) === 0) return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad);
-		return runPitchedBurn(disableGravityAndAtmosphere, substeps, program, angularVelocityBody, gimbalRad);
+		if (pitchAngleDeg(90, program) === 0) return runVerticalBurn(disableGravityAndAtmosphere, substeps, angularVelocityBody, gimbalRad, controllerEnabled);
+		return runPitchedBurn(disableGravityAndAtmosphere, substeps, program, angularVelocityBody, gimbalRad, controllerEnabled);
 	}
 	const env = createEarthEnvironment({
 		gravityEnabled: !disableGravityAndAtmosphere,
@@ -1566,7 +1785,7 @@ function runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, en
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const mark = { timeS: null };
@@ -1660,8 +1879,8 @@ function analyticForce(position, massKg, mu, equatorialRadiusM) {
 * Drag is not applied on that arc. Gravity off degenerates to a straight line.
 * A cutoff that never engages delegates to {@link runCoastBurn}.
 */
-function runKeplerCoast(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody = Vector3d.zero, gimbalRad = 0) {
-	if (cutoff.propellantRemainingKg === null && (cutoff.tCutoffS === null || cutoff.tCutoffS > endTimeS)) return runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody, gimbalRad);
+function runKeplerCoast(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody = Vector3d.zero, gimbalRad = 0, controllerEnabled = false) {
+	if (cutoff.propellantRemainingKg === null && (cutoff.tCutoffS === null || cutoff.tCutoffS > endTimeS)) return runCoastBurn(disableGravityAndAtmosphere, substeps, program, cutoff, endTimeS, angularVelocityBody, gimbalRad, controllerEnabled);
 	if (!Number.isInteger(substeps) || substeps < 1) throw new Error("substeps must be a positive integer");
 	const steps = Math.round(endTimeS * 50);
 	if (!(steps > 0) || Math.abs(endTimeS * 50 - steps) > 1e-6) throw new Error("end time must land on the 50 Hz step grid");
@@ -1671,7 +1890,7 @@ function runKeplerCoast(disableGravityAndAtmosphere, substeps, program, cutoff, 
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, controllerEnabled);
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const mark = { timeS: null };
@@ -1827,7 +2046,7 @@ function runMarsVerticalBurn(disableGravityAndAtmosphere, substeps = 1, duration
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad);
+	let state = createSeaLevelState(env, angularVelocityBody, gimbalRad, false);
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const logEvery = 250;
@@ -1865,7 +2084,7 @@ function runMarsEntry(disableGravityAndAtmosphere, substeps = 1, analytic = fals
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createEntryState(env, entry, angularVelocityBody, gimbalRad);
+	let state = createEntryState(env, entry, angularVelocityBody, gimbalRad, false);
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const mu = env.gravityEnabled ? env.muM3S2 : 0;
@@ -1941,7 +2160,7 @@ function runMarsTerminalLanding(disableGravityAndAtmosphere, substeps = 1, confi
 		includeJ2: false
 	});
 	const propulsion = createDefaultPropulsion();
-	let state = createEntryState(env, entry, angularVelocityBody, gimbalRad);
+	let state = createEntryState(env, entry, angularVelocityBody, gimbalRad, false);
 	const initialVelocity = state.velocity;
 	const initialMassKg = state.totalMassKg;
 	const sequence = new TerminalSequence(config);
@@ -1970,7 +2189,14 @@ function runMarsTerminalLanding(disableGravityAndAtmosphere, substeps = 1, confi
 		const height = altitudeM(env, state.position);
 		const speed = state.velocity.magnitude;
 		if (speed > peak) peak = speed;
-		const command = sequence.command(timeS, state.position, state.velocity, state.propellantMassKg, height);
+		const command = sequence.command(timeS, state.position, state.velocity, state.propellantMassKg, height, state.attitude, state.angularVelocityBody.z);
+		const flipping = command.bodyThrust === true && config.flipControllerEnabled !== false;
+		state = {
+			...state,
+			controllerEnabled: flipping,
+			pitchTargetRad: flipping ? verticalTargetRad(state.position) : 0,
+			flipHold: flipping
+		};
 		const phaseChanged = command.phase !== loggedPhase;
 		const onLog = n % logEvery === 0;
 		if (n % TERMINAL_FRAME_STRIDE === 0 || onLog || phaseChanged) {
@@ -1979,6 +2205,10 @@ function runMarsTerminalLanding(disableGravityAndAtmosphere, substeps = 1, confi
 		}
 		if (height <= 0) {
 			impact = assessImpact(state, Math.max(peak, state.velocity.magnitude));
+			if (command.phase === "Flip") impact = {
+				...impact,
+				flag: "RUD"
+			};
 			const landed = {
 				...state,
 				position: state.position.magnitude > 0 ? state.position.normalized.scale(env.equatorialRadiusM) : new Vector3d(0, env.equatorialRadiusM, 0)
@@ -2001,7 +2231,11 @@ function runMarsTerminalLanding(disableGravityAndAtmosphere, substeps = 1, confi
 			const hitSpeed = state.velocity.magnitude;
 			if (hitSpeed > peak) peak = hitSpeed;
 			impact = assessImpact(state, peak);
-			const hitCommand = sequence.command(endTimeS, state.position, state.velocity, state.propellantMassKg, 0);
+			if (command.phase === "Flip") impact = {
+				...impact,
+				flag: "RUD"
+			};
+			const hitCommand = sequence.command(endTimeS, state.position, state.velocity, state.propellantMassKg, 0, state.attitude, state.angularVelocityBody.z);
 			pushFrame(decorateTerminal(state, endTimeS, env, propulsion, impactCommand(config, state, hitCommand), impact, peak), true);
 			break;
 		}
@@ -2068,6 +2302,8 @@ var SOURCE_FILES = [
 	"Assets/Scripts/Math/QuaternionD.cs",
 	"Assets/Scripts/PhysicsCore/VehicleState.cs",
 	"Assets/Scripts/PhysicsCore/CylinderInertia.cs",
+	"Assets/Scripts/PhysicsCore/AeroMoment.cs",
+	"Assets/Scripts/PhysicsCore/AttitudeController.cs",
 	"Assets/Scripts/PhysicsCore/PlanetaryEnvironment.cs",
 	"Assets/Scripts/PhysicsCore/PropulsionModel.cs",
 	"Assets/Scripts/PhysicsCore/PitchProgram.cs",
@@ -2172,9 +2408,12 @@ function AresInstrument() {
 	const [entryPropellant, setEntryPropellant] = (0, import_react.useState)(5e4);
 	const [entryGamma, setEntryGamma] = (0, import_react.useState)(-12);
 	const [substeps, setSubsteps] = (0, import_react.useState)(1);
-	const [bodyRate, setBodyRate] = (0, import_react.useState)(.05);
+	const [bodyRate, setBodyRate] = (0, import_react.useState)(0);
 	const [bodyAxis, setBodyAxis] = (0, import_react.useState)("tumble");
 	const [gimbalDeg, setGimbalDeg] = (0, import_react.useState)(0);
+	const [controller, setController] = (0, import_react.useState)(true);
+	const [pitchErrorDeg, setPitchErrorDeg] = (0, import_react.useState)(0);
+	const [weathercock, setWeathercock] = (0, import_react.useState)(false);
 	const [index, setIndex] = (0, import_react.useState)("end");
 	const [copied, setCopied] = (0, import_react.useState)(false);
 	const [chartReady, setChartReady] = (0, import_react.useState)(false);
@@ -2187,9 +2426,12 @@ function AresInstrument() {
 		return new Vector3d(bodyRate, 0, 0);
 	}, [bodyAxis, bodyRate]);
 	const gimbalRad = gimbalDeg * Math.PI / 180;
+	const pitchAttitude = (0, import_react.useMemo)(() => pitchErrorDeg === 0 ? null : QuaternionD.fromAxisAngle(new Vector3d(0, 0, 1), pitchErrorDeg * Math.PI / 180), [pitchErrorDeg]);
 	const vacuumSeal = (0, import_react.useMemo)(() => runVerticalBurn(true, substeps), [substeps]);
 	const report = (0, import_react.useMemo)(() => {
+		if (weathercock) return runWeathercockCoast(substeps);
 		const vacuum = mode === "vacuum";
+		if (pitchAttitude) return runVerticalBurn(vacuum, substeps, Vector3d.zero, controller ? 0 : gimbalRad, controller, pitchAttitude);
 		if (body === "mars") {
 			if (origin === "entry") {
 				const entryState = marsEntryOrDefault(entrySpeed, entryPropellant, entryGamma);
@@ -2220,15 +2462,16 @@ function AresInstrument() {
 		if (coast === "kepler") return runKeplerCoast(vacuum, substeps, guided, engine === "cutoff" ? CUTOFF_AT_60_S : {
 			tCutoffS: null,
 			propellantRemainingKg: null
-		}, engine === "cutoff" ? 120 : 90, omega, gimbalRad);
-		if (engine === "cutoff") return runCoastBurn(vacuum, substeps, guided, CUTOFF_AT_60_S, 120, omega, gimbalRad);
-		if (program === "pitch") return runPitchedBurn(vacuum, substeps, DEFAULT_PITCH_PROGRAM, omega, gimbalRad);
-		if (vacuum) return bodyRate === 0 && gimbalRad === 0 ? vacuumSeal : runVerticalBurn(true, substeps, omega, gimbalRad);
-		return runVerticalBurn(false, substeps, omega, gimbalRad);
+		}, engine === "cutoff" ? 120 : 90, omega, gimbalRad, controller);
+		if (engine === "cutoff") return runCoastBurn(vacuum, substeps, guided, CUTOFF_AT_60_S, 120, omega, gimbalRad, controller);
+		if (program === "pitch") return runPitchedBurn(vacuum, substeps, DEFAULT_PITCH_PROGRAM, omega, gimbalRad, controller);
+		if (vacuum && !controller && bodyRate === 0 && gimbalRad === 0) return vacuumSeal;
+		return runVerticalBurn(vacuum, substeps, omega, controller ? 0 : gimbalRad, controller);
 	}, [
 		body,
 		bodyRate,
 		coast,
+		controller,
 		engine,
 		entryGamma,
 		entryPropellant,
@@ -2239,10 +2482,12 @@ function AresInstrument() {
 		mode,
 		omega,
 		origin,
+		pitchAttitude,
 		program,
 		substeps,
 		terminal,
-		vacuumSeal
+		vacuumSeal,
+		weathercock
 	]);
 	const frameIndex = index === "end" ? report.frames.length - 1 : Math.min(index, report.frames.length - 1);
 	const frame = report.frames[frameIndex] ?? report.frames[report.frames.length - 1];
@@ -2317,7 +2562,7 @@ function AresInstrument() {
 					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "text-xs tracking-widest text-primary uppercase",
-							children: gimbalDeg > 0 ? "Gimbal moment" : bodyRate > 0 ? "Torque-free Euler" : proportional || entryTuned ? "Mars GNC · Pass 8" : terminalArmed ? fixedFraction > 0 ? "Mars GNC · Pass 7" : "Mars GNC · Pass 6" : body === "mars" ? "Mars GNC · Pass 5" : report.analyticKepler ? "Mars GNC · Pass 4" : engine === "cutoff" ? "Mars GNC · Pass 3" : program === "pitch" ? "Mars GNC · Pass 2" : "Mars GNC · Pass 1"
+							children: pitchErrorDeg > 0 || controller && !weathercock && body === "earth" && !terminalArmed ? "Attitude hold" : weathercock ? "Aero moment" : gimbalDeg > 0 && !controller ? "Gimbal moment" : bodyRate > 0 && !controller ? "Torque-free Euler" : proportional || entryTuned ? "Mars GNC · Pass 8" : terminalArmed ? fixedFraction > 0 ? "Mars GNC · Pass 7" : "Mars GNC · Pass 6" : body === "mars" ? "Mars GNC · Pass 5" : report.analyticKepler ? "Mars GNC · Pass 4" : engine === "cutoff" ? "Mars GNC · Pass 3" : program === "pitch" ? "Mars GNC · Pass 2" : "Mars GNC · Pass 1"
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", {
 							className: "mt-1 font-mono text-3xl leading-none text-fg sm:text-4xl",
@@ -2326,9 +2571,9 @@ function AresInstrument() {
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
 							className: "mt-2 max-w-xl text-sm text-pretty text-muted",
 							children: [
-								body === "mars" ? origin === "entry" ? terminal === "default" ? proportional ? "Proportional landing law after the 3 km gate. The share is clamp(horizontal speed / 500 m/s, 0, 0.75) and is held for each 0.02 s step. Throttle stays 60%." : fixedFraction > 0 ? "Terminal sequence armed. Coast to 3 km, flip upright with thrust off, then a 60% burn aimed between local up and the anti-horizontal direction. The aim is held for each 0.02 s step." : "Terminal sequence armed. Coast to 3 km, flip to local vertical in 8 s with thrust off, then a 60% landing burn. Radial speed within 2 m/s and horizontal speed within 0.5 m/s is nominal. Anything faster is a RUD." : terminal === "early" ? proportional ? "Proportional landing law after the 5 km gate, then full thrust. The share is clamp(horizontal speed / 500 m/s, 0, 0.75). A 3.5 km/s, 200 t entry still meets the surface during the 8 s unpowered flip." : fixedFraction > 0 ? "Earlier gate at 5 km, full thrust, with the same scheduled horizontal share on the landing burn. The touchdown gate is unchanged." : "Earlier gate at 5 km, then the same 8 s flip and a 100% vertical burn. The touchdown gate is unchanged. This open-loop burn does not cancel horizontal speed." : entryTuned ? `Entry ${formatFixed(entrySpeed, 0)} m/s at ${formatFixed(entryGamma, 1)}°, ${formatFixed(entryPropellant, 0)} kg. Altitude stays 125 km. Engines stay off until a terminal sequence is armed.` : mode === "vacuum" ? "Entry interface with gravity and atmosphere off. 6 km/s at −12° holds a straight line. Engines stay off." : coast === "kepler" ? "125 km, 6,000 m/s, −12°. Engines off. After the capture instant the arc is drag-free Kepler and specific energy stays constant." : "125 km, 6,000 m/s, −12°, 50 t of propellant left. Engines off for 300 s. Numerical coast keeps the exponential Mars atmosphere." : coast === "kepler" ? "Kepler coast is armed, but the surface engine is still burning, so this run stays on RK4." : mode === "vacuum" ? "Mars selected with gravity and atmosphere off. Pure +Y thrust for 60 seconds." : "Mars surface. μ = 4.282837×10¹³ m³/s², ρ = 0.020 exp(−h / 11,100). Pure +Y thrust for 60 seconds. J2 is off." : report.analyticKepler ? program === "pitch" ? "Cutoff at 60 s, then a drag-free Kepler arc to 120 s. Horizontal speed and flight-path angle follow the captured orbit. Energy stays constant." : mode === "vacuum" ? "Cutoff at 60 s. With gravity off the analytic step is a straight line at constant speed." : "Cutoff at 60 s on the verified Earth burn, then universal-variable Kepler to 120 s. Drag is zero after the element capture." : engine === "cutoff" ? program === "pitch" ? "Pitch-over, then cutoff at 60 s. Coast to 120 s. Horizontal speed remains after the engine stops." : mode === "vacuum" ? "Cutoff at 60 s with gravity and atmosphere off. The coast is a straight constant-velocity line." : "Cutoff at 60 s. Thrust and mass flow stop. Coast to 120 s under gravity and drag." : program === "pitch" ? mode === "vacuum" ? "Pitch program with gravity and atmosphere off. Thrust stays +Y for 20 s, then leaves it at 1.0 deg/s." : "Open-loop pitch: inertial +Y for 20 s, then 1.0 deg/s toward +X." : coast === "kepler" ? "Kepler coast is armed, but thrust is still commanded, so this run stays on the verified RK4 burn." : mode === "vacuum" ? "Gravity and atmosphere are off. Inertial speed must match the ideal rocket equation within 0.1%." : "Sea-level Earth, point-mass gravity, exponential air. 100% thrust along inertial +Y for 90 seconds.",
-								bodyRate > 0 && gimbalDeg === 0 ? bodyAxis === "tumble" ? ` Torque-free tumble at ${bodyRate.toFixed(2)} rad/s on a 50 m × ${CYLINDER_RADIUS_M} m cylinder. External torque is zero. ωx and ωz exchange while ωy holds. |L| is conserved in the inertial frame at constant mass, and scales with mass while propellant leaves. Translation matches ω = 0.` : ` Principal spin ${bodyRate.toFixed(2)} rad/s about body +${bodyAxis.toUpperCase()}. External torque is zero, so this rate stays on the axis. Translation matches ω = 0.` : "",
-								gimbalDeg > 0 ? ` Gimbal ${gimbalDeg.toFixed(2)}° from body +Y toward +X${bodyRate > 0 ? `, with the ${bodyRate.toFixed(2)} rad/s body rate still on the vehicle` : ""}. Thrust acts 25 m aft of the CoM, so M = r × F and αz = Mz / Izz from rest. Zero gimbal restores Pass 10 and the translational baselines.` : ""
+								weathercock ? null : body === "mars" ? origin === "entry" ? terminal === "default" ? proportional ? "Proportional landing law after the 3 km gate. The share is clamp(horizontal speed / 500 m/s, 0, 0.75) and is held for each 0.02 s step. Throttle stays 60%." : fixedFraction > 0 ? "Terminal sequence armed. Coast to 3 km, then a powered flip at 60% thrust. The pitch loop holds the nose within 5° of local vertical before the landing burn aims between local up and the anti-horizontal direction." : "Terminal sequence armed. Coast to 3 km. The flip holds 60% thrust along body +Y and the pitch loop drives that axis onto local vertical. The landing burn starts only inside 5°. Radial speed within 2 m/s and horizontal speed within 0.5 m/s is nominal. An impact before that gate is a RUD." : terminal === "early" ? proportional ? "Proportional landing law after the 5 km gate, then full thrust. The share is clamp(horizontal speed / 500 m/s, 0, 0.75). The flip is the same powered pitch loop." : fixedFraction > 0 ? "Earlier gate at 5 km, powered flip, then full thrust with the scheduled horizontal share. The touchdown gate is unchanged." : "Earlier gate at 5 km, then the same powered flip and a 100% vertical burn. The touchdown gate is unchanged. Vertical thrust does not cancel horizontal speed." : entryTuned ? `Entry ${formatFixed(entrySpeed, 0)} m/s at ${formatFixed(entryGamma, 1)}°, ${formatFixed(entryPropellant, 0)} kg. Altitude stays 125 km. Engines stay off until a terminal sequence is armed.` : mode === "vacuum" ? "Entry interface with gravity and atmosphere off. 6 km/s at −12° holds a straight line. Engines stay off." : coast === "kepler" ? "125 km, 6,000 m/s, −12°. Engines off. After the capture instant the arc is drag-free Kepler and specific energy stays constant." : "125 km, 6,000 m/s, −12°, 50 t of propellant left. Engines off for 300 s. Numerical coast keeps the exponential Mars atmosphere." : coast === "kepler" ? "Kepler coast is armed, but the surface engine is still burning, so this run stays on RK4." : mode === "vacuum" ? "Mars selected with gravity and atmosphere off. Pure +Y thrust for 60 seconds." : "Mars surface. μ = 4.282837×10¹³ m³/s², ρ = 0.020 exp(−h / 11,100). Pure +Y thrust for 60 seconds. J2 is off." : report.analyticKepler ? program === "pitch" ? "Cutoff at 60 s, then a drag-free Kepler arc to 120 s. Horizontal speed and flight-path angle follow the captured orbit. Energy stays constant." : mode === "vacuum" ? "Cutoff at 60 s. With gravity off the analytic step is a straight line at constant speed." : "Cutoff at 60 s on the verified Earth burn, then universal-variable Kepler to 120 s. Drag is zero after the element capture." : engine === "cutoff" ? program === "pitch" ? "Pitch-over, then cutoff at 60 s. Coast to 120 s. Horizontal speed remains after the engine stops." : mode === "vacuum" ? "Cutoff at 60 s with gravity and atmosphere off. The coast is a straight constant-velocity line." : "Cutoff at 60 s. Thrust and mass flow stop. Coast to 120 s under gravity and drag." : program === "pitch" ? mode === "vacuum" ? "Pitch program with gravity and atmosphere off. Thrust stays +Y for 20 s, then leaves it at 1.0 deg/s." : "Open-loop pitch: inertial +Y for 20 s, then 1.0 deg/s toward +X." : coast === "kepler" ? "Kepler coast is armed, but thrust is still commanded, so this run stays on the verified RK4 burn." : mode === "vacuum" ? "Gravity and atmosphere are off. Inertial speed must match the ideal rocket equation within 0.1%." : "Sea-level Earth, point-mass gravity, exponential air. 100% thrust along inertial +Y for 90 seconds.",
+								weathercock || pitchErrorDeg > 0 || controller || gimbalDeg > 0 || bodyRate === 0 ? "" : bodyAxis === "tumble" ? mode === "vacuum" ? ` Torque-free tumble at ${bodyRate.toFixed(2)} rad/s on a 50 m × ${CYLINDER_RADIUS_M} m cylinder. External torque is zero. ωx and ωz exchange while ωy holds. |L| is conserved at constant mass. Translation matches ω = 0.` : ` Tumble at ${bodyRate.toFixed(2)} rad/s. ωy holds. In vacuum the exchange is torque-free. In air the center of pressure, ${COP_AXIAL_OFFSET_M} m aft, adds a restoring Mz when the nose leaves the velocity vector.` : mode === "vacuum" ? ` Principal spin ${bodyRate.toFixed(2)} rad/s about body +${bodyAxis.toUpperCase()}. External torque is zero, so this rate stays on the axis. Translation matches ω = 0.` : ` Principal spin ${bodyRate.toFixed(2)} rad/s about body +${bodyAxis.toUpperCase()}. The rate stays on the axis while the angle of attack is zero. A lateral velocity brings in the restoring aero moment.`,
+								pitchErrorDeg > 0 ? ` ${controller ? "Attitude hold" : "Open loop"} from a ${pitchErrorDeg}° pitch error. δ = −(1 θ + ${ATTITUDE_KD} ωz), stopped at ±${(GIMBAL_LIMIT_RAD * 180 / Math.PI).toFixed(0)}°. A zero error leaves the sealed burn unchanged. Controller off forces δ = 0.` : weathercock ? ` Engines off, gravity off, sea-level air. The nose starts 5° off a 100 m/s +Y velocity. The center of pressure is ${COP_AXIAL_OFFSET_M} m aft of the CoM, so a positive angle of attack produces a negative Mz and the nose weathervanes back through zero. Vacuum and zero angle of attack leave the translational baselines unchanged.` : !controller && gimbalDeg > 0 ? ` Gimbal ${gimbalDeg.toFixed(2)}° from body +Y toward +X${bodyRate > 0 ? `, with the ${bodyRate.toFixed(2)} rad/s body rate still on the vehicle` : ""}. Thrust acts 25 m aft of the CoM, so M = r × F and αz = Mz / Izz from rest. Zero gimbal restores the torque-free model and the translational baselines.` : controller ? " Pitch hold is armed. δ = −(Kp θ + Kd ωz) about body Z, clamped to ±5°. With no pitch error and no body rate the command is zero and the burn matches the sealed baseline." : ""
 							]
 						})
 					] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -2685,6 +2930,62 @@ function AresInstrument() {
 						className: "sm:w-64",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 							className: "mb-2 text-xs tracking-widest text-muted uppercase",
+							children: "Pitch disturbance"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border",
+							role: "radiogroup",
+							"aria-label": "Aerodynamic pitch disturbance",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModeButton, {
+								active: !weathercock,
+								onClick: () => setWeathercock(false),
+								children: "Burn"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModeButton, {
+								active: weathercock,
+								onClick: () => setWeathercock(true),
+								children: "5° coast"
+							})]
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "sm:w-64",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "mb-2 text-xs tracking-widest text-muted uppercase",
+							children: "Attitude hold"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border",
+							role: "radiogroup",
+							"aria-label": "Attitude controller",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModeButton, {
+								active: controller,
+								onClick: () => setController(true),
+								children: "On"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModeButton, {
+								active: !controller,
+								onClick: () => setController(false),
+								children: "Off"
+							})]
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "sm:w-64",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "mb-2 text-xs tracking-widest text-muted uppercase",
+							children: "Pitch error"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border",
+							role: "radiogroup",
+							"aria-label": "Initial pitch error",
+							children: [0, 5].map((angle) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModeButton, {
+								active: pitchErrorDeg === angle,
+								onClick: () => setPitchErrorDeg(angle),
+								children: angle === 0 ? "0°" : "5°"
+							}, angle))
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "sm:w-64",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "mb-2 text-xs tracking-widest text-muted uppercase",
 							children: "Gimbal"
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 							className: "grid grid-cols-3 gap-px overflow-hidden rounded-md border border-border bg-border",
@@ -2696,6 +2997,7 @@ function AresInstrument() {
 								.02
 							].map((angle) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModeButton, {
 								active: gimbalDeg === angle,
+								disabled: controller,
 								onClick: () => setGimbalDeg(angle),
 								children: angle === 0 ? "0°" : `${angle.toFixed(2)}°`
 							}, angle))
@@ -2980,16 +3282,23 @@ function AresInstrument() {
 									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
 										className: "mt-1 font-mono text-xs tabular-nums text-muted",
 										children: [
-											"Mz ",
-											formatFixed(frame.momentZ, 0),
-											" N·m",
+											"θ ",
+											formatFixed(frame.pitchAngleRad * 180 / Math.PI, 3),
+											"°",
 											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 												className: "mx-1",
 												children: "·"
 											}),
-											"αz ",
-											frame.alphaZ.toExponential(3),
-											" rad/s²"
+											"δ ",
+											formatFixed(frame.gimbalRad * 180 / Math.PI, 3),
+											"°",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "mx-1",
+												children: "·"
+											}),
+											"Mz ",
+											formatFixed(frame.momentZ, 0),
+											" N·m"
 										]
 									})
 								]
@@ -3147,6 +3456,26 @@ function AresInstrument() {
 									label: "Iyy",
 									value: formatFixed(frame.inertiaIyy, 0),
 									unit: "kg·m² · axial"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Channel, {
+									label: "Pitch error",
+									value: formatFixed(frame.pitchAngleRad * 180 / Math.PI, 3),
+									unit: "deg about Z"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Channel, {
+									label: "Gimbal command",
+									value: formatFixed(frame.gimbalRad * 180 / Math.PI, 3),
+									unit: controller ? "PD · ±5°" : "open loop"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Channel, {
+									label: "Angle of attack",
+									value: formatFixed(frame.angleOfAttackRad * 180 / Math.PI, 3),
+									unit: "deg"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Channel, {
+									label: "Aero moment z",
+									value: formatFixed(frame.aeroMomentZ, 0),
+									unit: "N·m"
 								}),
 								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Channel, {
 									label: "Gimbal",
@@ -3321,7 +3650,7 @@ function AresInstrument() {
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "Δv = Isp g0 ln(m0 / mf)" }),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "q̇ = ½ q ⊗ ω" }),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "I ω̇ + ω × Iω = M" }),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "M = r × F" })
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "δ = −(Kp θ + Kd ωz)" })
 						]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("dl", {
@@ -3376,6 +3705,14 @@ function AresInstrument() {
 								v: gimbalDeg === 0 ? "M = 0" : "M = r × F"
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Const, {
+								k: "Hold",
+								v: controller ? `Kp 1 · Kd ${ATTITUDE_KD} s` : "controller off"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Const, {
+								k: "CoP",
+								v: `${COP_AXIAL_OFFSET_M} m aft of CoM`
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Const, {
 								k: "Offset",
 								v: `25 m aft of CoM`
 							}),
@@ -3407,11 +3744,11 @@ function AresInstrument() {
 								terminalArmed ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Const, {
 										k: "Flip",
-										v: "8 s · thrust off"
+										v: "60% until within 5° of vertical"
 									}),
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Const, {
 										k: "Landing thrust",
-										v: terminal === "early" ? "100% after 5 km" : "60% after 3 km"
+										v: terminal === "early" ? "100% after alignment" : "60% after alignment"
 									}),
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Const, {
 										k: "Nominal",
@@ -3437,7 +3774,7 @@ function AresInstrument() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
 						className: "mt-4 text-sm text-pretty text-muted",
-						children: ["No wind, no planetary rotation. The vehicle is a uniform cylinder, 50 m tall and 4.5 m in radius, so the inertia tensor scales with the current mass. The nozzle sits half a length aft of the center of mass. A zero gimbal keeps thrust on the body axis, the moment is zero, and Euler’s equation is the torque-free Pass 10 model. A fixed gimbal holds the thrust vector off +Y, maps that direction into M = r × F, and integrates it with the translational step. Set the gimbal and the body rate to 0 to reproduce every translational baseline. J2 is implemented and left off for this verification. g0 defines exhaust velocity only. Local gravity is μ/r², about 9.820 m/s² at the surface with these constants. Cutoff sets thrust and mass flow to zero. Numerical coast keeps RK4, including drag on Earth. Analytic Kepler replaces that coast with a universal-variable step and zero drag. The Unity scripts are the same core and do not call PhysX. Leave Analytic Kepler off to reproduce the verified burn numbers.", terminalArmed ? proportional ? " Terminal sequence is open-loop and Mars-entry only. Proportional mode sets the landing-burn horizontal share from current horizontal speed and holds that direction for each 0.02 s step. Fixed mode with fraction 0 keeps the Pass 6 burn." : fixedFraction > 0 ? " Terminal sequence is open-loop and Mars-entry only. The landing burn mixes local up with a share opposing horizontal velocity, held constant across each RK4 step. Set Horiz to 0 to restore the Pass 6 vertical burn." : " Terminal sequence is open-loop and Mars-entry only. The flip slews thrust from anti-velocity to local up, then holds vertical thrust. Impact altitude is clamped at 0. Leave Terminal off to keep the Pass 1–5 numbers." : body === "mars" ? " Mars uses the same integrator. Surface gravity is μ/R², about 3.73 m/s². The entry start does not change any Earth run." : ""]
+						children: ["No wind, no planetary rotation. The vehicle is a uniform cylinder, 50 m tall and 4.5 m in radius, so the inertia tensor scales with the current mass. The nozzle sits half a length aft of the center of mass. A pitch loop commands the gimbal, δ = −(Kp θ + Kd ωz), and stops it at ±5°. Controller off, or a zero pitch error with zero rate, leaves that command at zero and the translational burn unchanged. The center of pressure sits a quarter length aft, so a positive angle of attack produces a negative restoring moment. That moment is identically zero in vacuum and at zero angle of attack, and it is not added to the translational force. Set the controller off and the gimbal and body rate to 0 to reproduce every translational baseline. J2 is implemented and left off for this verification. g0 defines exhaust velocity only. Local gravity is μ/r², about 9.820 m/s² at the surface with these constants. Cutoff sets thrust and mass flow to zero. Numerical coast keeps RK4, including drag on Earth. Analytic Kepler replaces that coast with a universal-variable step and zero drag. The Unity scripts are the same core and do not call PhysX. Leave Analytic Kepler off to reproduce the verified burn numbers.", terminalArmed ? proportional ? " The flip is a powered pitch loop on body Z, Mars entry only. Proportional mode sets the landing-burn horizontal share from current horizontal speed after the nose is within 5° of vertical. Locking the gimbal leaves the vehicle unaligned and the impact is a RUD." : fixedFraction > 0 ? " The flip is a powered pitch loop on body Z, Mars entry only. After alignment the landing burn mixes local up with a share opposing horizontal velocity. Set Horiz to 0 for a vertical landing burn." : " The flip holds 60% thrust along body +Y. Gimbal deflection is −(Kp θ + Kd ωz), stopped at ±5°, and the landing burn waits until the nose is within 5° of local vertical. An impact before that gate is a RUD. Leave Terminal off to keep the Pass 1–5 numbers." : body === "mars" ? " Mars uses the same integrator. Surface gravity is μ/R², about 3.73 m/s². The entry start does not change any Earth run." : ""]
 					})
 				]
 			}),

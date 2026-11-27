@@ -6,6 +6,8 @@ import {
   type PlanetaryEnvironment,
 } from "./planetary-environment.ts";
 import { isFiring, massFlowKgS, thrustMagnitudeN, type PropulsionModel } from "./propulsion.ts";
+import { effectiveGimbalRad } from "./attitude-controller.ts";
+import { aerodynamicMoment } from "./aero-moment.ts";
 import { bodyThrustDirection, gimbalMoment, integrateEulerRk4, integrateEulerSubsteps } from "./cylinder-inertia.ts";
 import { QuaternionD } from "./quaternion.ts";
 import { cloneState, type VehicleState } from "./vehicle-state.ts";
@@ -124,6 +126,9 @@ function advance(state: VehicleState, deriv: Derivative, h: number): VehicleStat
     initialAttitude: state.initialAttitude,
     angularVelocityBody: state.angularVelocityBody,
     gimbalRad: state.gimbalRad,
+    controllerEnabled: state.controllerEnabled,
+    pitchTargetRad: state.pitchTargetRad,
+    flipHold: state.flipHold,
   };
 }
 
@@ -153,8 +158,9 @@ function rk4(
   throttle: number,
   thrustDirection?: Vector3d,
 ): VehicleState {
-  if (state.gimbalRad !== 0 && throttle > 0) {
-    thrustDirection = state.attitude.rotate(bodyThrustDirection(state.gimbalRad));
+  const gimbal = effectiveGimbalRad(state);
+  if (gimbal !== 0 && throttle > 0) {
+    thrustDirection = state.attitude.rotate(bodyThrustDirection(gimbal));
   }
   const k1 = derivative(state, env, propulsion, throttle, thrustDirection);
   const k2 = derivative(advance(state, k1, dt * 0.5), env, propulsion, throttle, thrustDirection);
@@ -168,15 +174,30 @@ function rk4(
   } else {
     next.totalMassKg = massFromPropellant(next.propellantMassKg);
   }
-  if (state.gimbalRad !== 0) {
-    const moment = gimbalMoment(thrustMagnitudeN(propulsion, throttle, next.propellantMassKg), state.gimbalRad);
-    if (moment.x !== 0 || moment.y !== 0 || moment.z !== 0 || !QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
-      const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt, moment);
+  const aero = state.flipHold
+    ? Vector3d.zero
+    : aerodynamicMoment(state.attitude, state.velocity, atmosphericDensityKgM3(env, state.position));
+  const aeroOn = aero.x !== 0 || aero.y !== 0 || aero.z !== 0;
+  if (!aeroOn) {
+    if (gimbal !== 0) {
+      const moment = gimbalMoment(thrustMagnitudeN(propulsion, throttle, next.propellantMassKg), gimbal);
+      if (moment.x !== 0 || moment.y !== 0 || moment.z !== 0 || !QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
+        const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt, moment);
+        next.attitude = rotation.attitude;
+        next.angularVelocityBody = rotation.omega;
+      }
+    } else if (!QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
+      const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt);
       next.attitude = rotation.attitude;
       next.angularVelocityBody = rotation.omega;
     }
-  } else if (!QuaternionD.angularVelocityIsZero(state.angularVelocityBody)) {
-    const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt);
+  } else {
+    let moment = aero;
+    if (gimbal !== 0) {
+      const thrustMoment = gimbalMoment(thrustMagnitudeN(propulsion, throttle, next.propellantMassKg), gimbal);
+      moment = new Vector3d(thrustMoment.x + aero.x, thrustMoment.y + aero.y, thrustMoment.z + aero.z);
+    }
+    const rotation = integrateEulerRk4(state.attitude, state.angularVelocityBody, next.totalMassKg, dt, moment);
     next.attitude = rotation.attitude;
     next.angularVelocityBody = rotation.omega;
   }
@@ -218,10 +239,12 @@ function stepOne(
 /**
  * Advance the vehicle by `dt` seconds using `substeps` equal RK4 sub-steps.
  * Attitude and body rate advance on the same sub-steps.
- * A zero gimbal leaves the thrust line on the body axis, so the moment is zero and this
+ * A zero gimbal and a zero aerodynamic moment leave the thrust line on the body axis, so this
  * step is the Pass 10 integrator. A non-zero gimbal holds the thrust vector off +Y in the
  * body frame, points the translational thrust along it, and applies M = r × F.
- * Identically zero ω and zero gimbal leave the quaternion untouched.
+ * Aerodynamic moment is added only when density and angle of attack are both non-zero.
+ * It does not enter the translational force sum. Identically zero ω, zero gimbal, and zero
+ * aero moment leave the quaternion untouched.
  * Mutates nothing: returns the next state.
  */
 export function stepRk4(

@@ -13,6 +13,8 @@ import {
 } from "./constants.ts";
 import { horizontalSpeedMps } from "./pitch-program.ts";
 import type { TelemetryFrame } from "./telemetry.ts";
+import { GIMBAL_LIMIT_RAD, gimbalCommandRad, verticalPitchErrorRad, verticalTargetRad } from "./attitude-controller.ts";
+import { bodyThrustDirection } from "./cylinder-inertia.ts";
 import { QuaternionD } from "./quaternion.ts";
 import type { VehicleState } from "./vehicle-state.ts";
 import { Vector3d } from "./vector3d.ts";
@@ -20,8 +22,9 @@ import { Vector3d } from "./vector3d.ts";
 export type TerminalPhase = "Coast" | "Flip" | "LandingBurn" | "Complete";
 
 /**
- * Open-loop terminal sequence. Null trigger fields are off.
- * Altitude and time are OR'd: the first one that is true arms the flip.
+ * Powered terminal sequence. The flip holds 60% thrust along body +Y and the pitch
+ * loop drives body +Y onto local vertical. Landing thrust starts only inside 5°.
+ * Null trigger fields are off. Altitude and time are OR'd.
  */
 export interface TerminalSequenceConfig {
   triggerAltitudeM: number | null;
@@ -48,9 +51,14 @@ export interface TerminalSequenceConfig {
   proportionalSpeedRefMps?: number;
   /** Upper clamp of the proportional fraction. Default 0.75. */
   maxHorizontalFraction?: number;
+  /**
+   * Powered flip uses the pitch PD. False locks δ = 0 and never opens the alignment gate.
+   * Omitted means the controller is armed.
+   */
+  flipControllerEnabled?: boolean;
 }
 
-/** Case B. Flip at 3 km, thrust off during the flip, then 60% vertical. */
+/** Case B. Powered flip at 3 km, 60% thrust, then the landing burn. */
 export const DEFAULT_TERMINAL_SEQUENCE: TerminalSequenceConfig = {
   triggerAltitudeM: TERMINAL_TRIGGER_ALTITUDE_M,
   triggerTimeS: null,
@@ -75,6 +83,8 @@ export interface TerminalCommand {
   throttle: number;
   direction: Vector3d;
   pitchFromVerticalDeg: number;
+  /** True while the flip thrust follows the body and the PD, not a slewed inertial aim. */
+  bodyThrust?: boolean;
   /** Present only when a horizontal landing component is commanded. */
   horizontalFraction?: number;
   /** Present only on a proportional landing command. */
@@ -174,14 +184,13 @@ export function proportionalHorizontalFraction(config: TerminalSequenceConfig, p
 }
 
 /**
- * Point-mass terminal sequence. Thrust direction slews from the trigger's
- * anti-velocity vector to local up, then stays on local up unless a horizontal
- * landing fraction is set. No attitude state.
+ * Powered flip onto local vertical, then the landing burn.
+ * The flip torque is the PD gimbal moment. Landing aim is unchanged.
  */
 export class TerminalSequence {
   readonly config: TerminalSequenceConfig;
   private triggerAtS: number | null = null;
-  private retrograde: Vector3d | null = null;
+  private aligned = false;
 
   constructor(config: TerminalSequenceConfig) {
     this.config = config;
@@ -191,36 +200,48 @@ export class TerminalSequence {
     return this.triggerAtS;
   }
 
-  command(timeS: number, position: Vector3d, velocity: Vector3d, propellantKg: number, altitudeM: number): TerminalCommand {
+  command(
+    timeS: number,
+    position: Vector3d,
+    velocity: Vector3d,
+    propellantKg: number,
+    altitudeM: number,
+    attitude: QuaternionD = QuaternionD.identity,
+    omegaZ = 0,
+  ): TerminalCommand {
     const up = localUp(position);
     if (this.triggerAtS === null) {
       const byTime = this.config.triggerTimeS !== null && timeS >= this.config.triggerTimeS;
       const byAltitude = this.config.triggerAltitudeM !== null && altitudeM > 0 && altitudeM <= this.config.triggerAltitudeM;
-      if (byTime || byAltitude) {
-        this.triggerAtS = timeS;
-        this.retrograde = velocity.magnitude > 0 ? velocity.normalized.scale(-1) : up;
-      }
+      if (byTime || byAltitude) this.triggerAtS = timeS;
     }
 
-    if (this.triggerAtS === null || this.retrograde === null) {
+    if (this.triggerAtS === null) {
       return { phase: "Coast", throttle: 0, direction: up, pitchFromVerticalDeg: 0 };
     }
 
-    const elapsed = timeS - this.triggerAtS;
     const cutoff = this.config.manualCutoffS !== null && timeS >= this.config.manualCutoffS;
-    if (elapsed < this.config.flipDurationS && !cutoff) {
-      const blend = this.config.flipDurationS > 0 ? elapsed / this.config.flipDurationS : 1;
-      const direction = slerpUnit(this.retrograde, up, blend);
+    if (cutoff || propellantKg <= 0) {
+      return { phase: "Complete", throttle: 0, direction: up, pitchFromVerticalDeg: 0 };
+    }
+
+    const armed = this.config.flipControllerEnabled !== false;
+    if (!this.aligned && armed && timeS > this.triggerAtS) {
+      const error = verticalPitchErrorRad(attitude, position);
+      if (Math.abs(error) <= GIMBAL_LIMIT_RAD) this.aligned = true;
+    }
+
+    if (!this.aligned) {
+      const target = verticalTargetRad(position);
+      const delta = armed ? gimbalCommandRad(attitude, omegaZ, target) : 0;
+      const direction = attitude.rotate(bodyThrustDirection(delta));
       return {
         phase: "Flip",
         throttle: this.config.flipThrottle,
         direction,
         pitchFromVerticalDeg: pitchFromVerticalDeg(direction, position),
+        bodyThrust: true,
       };
-    }
-
-    if (cutoff || propellantKg <= 0) {
-      return { phase: "Complete", throttle: 0, direction: up, pitchFromVerticalDeg: 0 };
     }
 
     if (this.config.guidanceMode === "Proportional") {
@@ -315,6 +336,9 @@ export function surfaceState(before: VehicleState, after: VehicleState, radiusM:
         mix(before.angularVelocityBody.z, after.angularVelocityBody.z),
       ),
       gimbalRad: before.gimbalRad,
+      controllerEnabled: before.controllerEnabled,
+      pitchTargetRad: before.pitchTargetRad,
+      flipHold: before.flipHold,
       attitude:
         before.attitude.x === after.attitude.x &&
         before.attitude.y === after.attitude.y &&
